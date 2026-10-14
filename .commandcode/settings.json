@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Shell(curl -sfL -o run/tools/seaweedfs.tar.gz https://github.com/seaweedfs/seaweedfs/releases/latest/download/linux_amd64.tar.gz)",
+      "Shell(tar:*)",
+      "Shell(rm:*)",
+      "Shell(python3 -m pip --version 2 >& 1)",
+      "Shell(find:*)"
+    ],
+    "deny": [],
+    "defaultMode": "default"
+  }
+}

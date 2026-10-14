@@ -4,5 +4,8 @@
 - Security-conscious: credentials/secrets belong in a private config file and must never be logged. Confidence: 0.85
 - Prefers fail-safe data-handling patterns: verify new artifacts (e.g. upload + checksum) before replacing or deleting existing good ones, never delete the only valid copy before its replacement is confirmed, preserve prior state on failure, and update state files atomically. Confidence: 0.85
 - Prefers essential-only logging (startup, success, failure) and minimal resource/temp-file footprint. Confidence: 0.75
+- Demands thorough runtime verification before delivery, not just successful compilation: after repeated runtime crashes, explicitly asked for proper testing ("test it properly so, i don't get any errors again"); run the software end-to-end (e.g. launch a real server with the built artifact) before claiming done. Confidence: 0.9
+- When pasting error stack traces, wants an explicit diagnosis of whether the root cause is code or configuration (and, if code, a fix; if configuration, where and why). Confidence: 0.85
+- Prefers fail-safe data-handling patterns: verify new artifacts (e.g. upload + checksum) before replacing or deleting existing good ones, preserve prior state on failure, and update state files atomically. Confidence: 0.8
 - Prefers fail-safe data-handling patterns: verify new artifacts (e.g. upload + checksum) before replacing or deleting existing good ones, preserve prior state on failure, and update state files atomically. Confidence: 0.8
 - Prefers essential-only logging (startup, success, failure) and minimal resource/temp-file footprint. Confidence: 0.75

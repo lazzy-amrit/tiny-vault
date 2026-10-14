@@ -2,8 +2,6 @@ package dev.tinyvault;
 
 import org.bukkit.plugin.java.JavaPlugin;
 
-import java.io.IOException;
-
 public final class TinyVaultPlugin extends JavaPlugin {
     private BackupCoordinator coordinator;
 
@@ -12,16 +10,12 @@ public final class TinyVaultPlugin extends JavaPlugin {
         saveDefaultConfig();
         try {
             coordinator = BackupCoordinator.create(this);
-        } catch (IllegalStateException e) {
-            getLogger().severe(e.getMessage());
+            coordinator.start();
+        } catch (Exception e) {
+            getLogger().severe("Could not start backups: " + e.getMessage());
+            coordinator = null;
             getServer().getPluginManager().disablePlugin(this);
-            return;
-        } catch (IOException e) {
-            getLogger().severe("Could not read backup state: " + e.getMessage());
-            getServer().getPluginManager().disablePlugin(this);
-            return;
         }
-        coordinator.start();
     }
 
     @Override

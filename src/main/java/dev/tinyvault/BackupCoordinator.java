@@ -63,10 +63,23 @@ final class BackupCoordinator {
         BackupState state = new BackupState(plugin.getDataFolder().toPath().resolve("state.txt"));
         state.load();
         S3BackupStore store = new S3BackupStore(endpoint, region, pathStyle, bucket, accessKey, secretKey);
-        ServerArchiver archiver = new ServerArchiver(
-                plugin.getDataFolder().getParentFile().getParentFile().toPath(),
-                plugin.getDataFolder().toPath());
+        ServerArchiver archiver = new ServerArchiver(serverRoot(plugin), plugin.getDataFolder().toPath());
         return new BackupCoordinator(plugin, store, archiver, state);
+    }
+
+    /**
+     * The server directory is the one containing the plugins folder. The data
+     * folder path may be relative, so it is resolved against the working
+     * directory before walking up; with an unexpected folder layout this falls
+     * back to the working directory itself.
+     */
+    private static Path serverRoot(Plugin plugin) {
+        Path dataFolder = plugin.getDataFolder().toPath().toAbsolutePath().normalize();
+        Path pluginsDir = dataFolder.getParent();
+        if (pluginsDir != null && pluginsDir.getParent() != null) {
+            return pluginsDir.getParent().normalize();
+        }
+        return Path.of("").toAbsolutePath().normalize();
     }
 
     void start() {
