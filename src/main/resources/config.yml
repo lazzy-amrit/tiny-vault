@@ -1,0 +1,21 @@
+# TinyVault configuration.
+# Keep this file private: it contains storage credentials.
+
+# FileLu S5 endpoint. Regional hosts: https://ap.s5lu.com (Asia Pacific),
+# https://us.s5lu.com, https://eu.s5lu.com, https://me.s5lu.com, or the global
+# https://s5lu.com.
+endpoint: "https://ap.s5lu.com"
+
+# Bucket = the FileLu folder enabled as an S5 bucket
+# (file manager -> Edit Folder -> S5 Bucket -> Save).
+bucket: ""
+
+# FileLu ignores the region; us-east-1 is the documented value.
+region: "us-east-1"
+
+# FileLu S5 uses path-style addressing.
+path-style: true
+
+# S5 credentials from My Account on filelu.com.
+access-key: ""
+secret-key: ""

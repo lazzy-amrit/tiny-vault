@@ -1,0 +1,5 @@
+name: TinyVault
+version: '${version}'
+main: dev.tinyvault.TinyVaultPlugin
+api-version: '26.2'
+description: Minimal automatic whole-server backups to S3-compatible storage.
