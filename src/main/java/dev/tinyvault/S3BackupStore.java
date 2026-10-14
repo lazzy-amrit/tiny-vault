@@ -8,11 +8,22 @@ import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.S3ClientBuilder;
 import software.amazon.awssdk.services.s3.S3Configuration;
+import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
+import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
+import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
+import software.amazon.awssdk.services.s3.model.ListMultipartUploadsRequest;
+import software.amazon.awssdk.services.s3.model.ListMultipartUploadsResponse;
+import software.amazon.awssdk.services.s3.model.MultipartUpload;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.PutObjectRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartRequest;
+import software.amazon.awssdk.services.s3.model.UploadPartResponse;
 
 import java.io.IOException;
 import java.io.InputStream;
@@ -21,6 +32,13 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
 
 /**
  * Minimal FileLu S5 storage handling. The bucket holds exactly one backup plus
@@ -34,12 +52,16 @@ import java.security.NoSuchAlgorithmException;
  * The new archive is uploaded to the temp slot and verified before the old
  * current.zip is touched, so a failed or interrupted run always leaves the
  * existing backup intact. FileLu S5 does not document server-side copy, so
- * promotion is a fresh upload of the same local file.
+ * promotion is a fresh upload of the same local file. Large archives are sent
+ * as multipart uploads (FileLu's gateway rejects long single-request PUTs),
+ * and interrupted uploads are aborted so their parts never consume quota.
  */
 final class S3BackupStore implements AutoCloseable {
     static final String PREFIX = "backups/";
     private static final String TEMP_KEY = PREFIX + "uploading.zip";
     private static final String CURRENT_KEY = PREFIX + "current.zip";
+    private static final long PART_SIZE = 64L * 1024 * 1024;
+    private static final int MAX_PARALLEL_PARTS = 3;
 
     private final S3Client s3;
     private final String bucket;
@@ -48,7 +70,8 @@ final class S3BackupStore implements AutoCloseable {
         S3ClientBuilder builder = S3Client.builder()
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)))
-                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(pathStyle).build());
+                .serviceConfiguration(S3Configuration.builder().pathStyleAccessEnabled(pathStyle).build())
+                .requestChecksumCalculation(RequestChecksumCalculation.WHEN_REQUIRED);
         if (endpoint != null && !endpoint.isBlank()) {
             builder.endpointOverride(URI.create(endpoint));
         }
@@ -65,6 +88,7 @@ final class S3BackupStore implements AutoCloseable {
      */
     void rotate(Path archive, long size) throws IOException {
         deleteQuietly(TEMP_KEY);
+        abortStaleUploads();
         upload(TEMP_KEY, archive);
         verifyUpload(TEMP_KEY, archive, size);
 
@@ -75,7 +99,103 @@ final class S3BackupStore implements AutoCloseable {
     }
 
     private void upload(String key, Path file) throws IOException {
-        s3.putObject(PutObjectRequest.builder().bucket(bucket).key(key).build(), RequestBody.fromFile(file));
+        long size = Files.size(file);
+        if (size <= PART_SIZE) {
+            s3.putObject(PutObjectRequest.builder().bucket(bucket).key(key).build(), RequestBody.fromFile(file));
+            return;
+        }
+        CreateMultipartUploadResponse create = s3.createMultipartUpload(
+                CreateMultipartUploadRequest.builder().bucket(bucket).key(key).build());
+        try {
+            List<CompletedPart> parts = uploadParts(key, create.uploadId(), file, size);
+            s3.completeMultipartUpload(CompleteMultipartUploadRequest.builder()
+                    .bucket(bucket)
+                    .key(key)
+                    .uploadId(create.uploadId())
+                    .multipartUpload(CompletedMultipartUpload.builder().parts(parts).build())
+                    .build());
+        } catch (Exception failure) {
+            try {
+                s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                        .bucket(bucket).key(key).uploadId(create.uploadId()).build());
+            } catch (Exception ignored) {
+                // interrupted multipart uploads are also aborted at the start of the next rotation
+            }
+            throw failure;
+        }
+    }
+
+    /** Uploads all parts (up to three concurrently) and returns them in order. */
+    private List<CompletedPart> uploadParts(String key, String uploadId, Path file, long size) throws IOException {
+        int partCount = (int) ((size + PART_SIZE - 1) / PART_SIZE);
+        ExecutorService pool = Executors.newFixedThreadPool(Math.min(partCount, MAX_PARALLEL_PARTS), runnable -> {
+            Thread thread = new Thread(runnable, "TinyVault-part");
+            thread.setDaemon(true);
+            return thread;
+        });
+        try {
+            List<CompletableFuture<CompletedPart>> futures = new ArrayList<>(partCount);
+            for (int partNumber = 1; partNumber <= partCount; partNumber++) {
+                final int number = partNumber;
+                futures.add(CompletableFuture.supplyAsync(
+                        () -> uploadPart(key, uploadId, file, number, size), pool));
+            }
+            List<CompletedPart> parts = new ArrayList<>(partCount);
+            try {
+                for (CompletableFuture<CompletedPart> future : futures) {
+                    parts.add(future.join());
+                }
+            } catch (CompletionException e) {
+                Throwable cause = e.getCause();
+                if (cause instanceof java.io.UncheckedIOException unchecked) {
+                    cause = unchecked.getCause();
+                }
+                if (cause instanceof IOException io) {
+                    throw io;
+                }
+                throw new IOException(String.valueOf(cause), cause);
+            }
+            parts.sort(Comparator.comparingInt(CompletedPart::partNumber));
+            return parts;
+        } finally {
+            pool.shutdownNow();
+        }
+    }
+
+    private CompletedPart uploadPart(String key, String uploadId, Path file, int partNumber, long size) {
+        long offset = (long) (partNumber - 1) * PART_SIZE;
+        long length = Math.min(PART_SIZE, size - offset);
+        try (InputStream in = Files.newInputStream(file)) {
+            in.skipNBytes(offset);
+            UploadPartResponse response = s3.uploadPart(UploadPartRequest.builder()
+                    .bucket(bucket)
+                    .key(key)
+                    .uploadId(uploadId)
+                    .partNumber(partNumber)
+                    .contentLength(length)
+                    .build(), RequestBody.fromInputStream(in, length));
+            return CompletedPart.builder().partNumber(partNumber).eTag(response.eTag()).build();
+        } catch (IOException e) {
+            throw new java.io.UncheckedIOException("Failed to read part " + partNumber + " of " + file, e);
+        }
+    }
+
+    /** Aborts leftover multipart uploads of our keys so interrupted runs never leak quota. */
+    private void abortStaleUploads() {
+        try {
+            ListMultipartUploadsResponse uploads = s3.listMultipartUploads(
+                    ListMultipartUploadsRequest.builder().bucket(bucket).prefix(PREFIX).build());
+            for (MultipartUpload upload : uploads.uploads()) {
+                try {
+                    s3.abortMultipartUpload(AbortMultipartUploadRequest.builder()
+                            .bucket(bucket).key(upload.key()).uploadId(upload.uploadId()).build());
+                } catch (Exception ignored) {
+                    // best effort
+                }
+            }
+        } catch (Exception ignored) {
+            // listing is best effort; rotation continues
+        }
     }
 
     private void verifyUpload(String key, Path file, long size) throws IOException {

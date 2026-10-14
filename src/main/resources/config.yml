@@ -10,8 +10,9 @@ endpoint: "https://ap.s5lu.com"
 # (file manager -> Edit Folder -> S5 Bucket -> Save).
 bucket: ""
 
-# FileLu ignores the region; us-east-1 is the documented value.
-region: "us-east-1"
+# FileLu region. The documented default is "global"; other valid values are
+# "us-east", "eu-central", "ap-southeast", "me-central" (per endpoint).
+region: "global"
 
 # FileLu S5 uses path-style addressing.
 path-style: true

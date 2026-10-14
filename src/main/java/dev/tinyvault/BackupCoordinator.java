@@ -57,7 +57,7 @@ final class BackupCoordinator {
             throw new IllegalStateException("bucket, access-key and secret-key must be set in plugins/TinyVault/config.yml");
         }
         String endpoint = config.getString("endpoint", "https://ap.s5lu.com").strip();
-        String region = config.getString("region", "us-east-1").strip();
+        String region = config.getString("region", "global").strip();
         boolean pathStyle = config.getBoolean("path-style", true);
 
         BackupState state = new BackupState(plugin.getDataFolder().toPath().resolve("state.txt"));
