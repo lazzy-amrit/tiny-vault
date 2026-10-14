@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "dev.tinyvault"
-version = "1.1.0"
+version = "1"
 
 java {
     toolchain {
@@ -21,6 +21,7 @@ repositories {
 dependencies {
     compileOnly("io.papermc.paper:paper-api:26.2.build.+")
     implementation("software.amazon.awssdk:s3:2.55.16")
+    implementation("software.amazon.awssdk:url-connection-client:2.55.16")
 }
 
 tasks {
@@ -35,6 +36,7 @@ tasks {
     }
     shadowJar {
         archiveClassifier = ""
+        mergeServiceFiles()
         relocate("software.amazon.awssdk", "dev.tinyvault.shaded.awssdk")
     }
     build {

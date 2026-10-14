@@ -17,7 +17,7 @@ gradle shadowJar
 ```
 
 A Java 25 toolchain is provisioned automatically by Gradle. Output:
-`build/libs/TinyVault-1.1.0.jar`.
+`build/libs/TinyVault-1.jar`.
 
 ## Install
 
