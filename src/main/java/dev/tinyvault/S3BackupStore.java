@@ -258,14 +258,31 @@ final class S3BackupStore implements AutoCloseable {
     /* ---- verification and small operations ---- */
 
     private void verifyUpload(String key, Path file, long size) throws IOException {
-        HeadObjectResponse head = head(key);
-        if (head.contentLength() != size) {
-            throw new IOException(key + ": expected " + size + " bytes but remote object has " + head.contentLength());
+        // FileLu's gateway is eventually consistent: right after an upload (or
+        // a delete) HEAD can still report the previous object. Re-check a few
+        // times before failing.
+        IOException failure = null;
+        for (int attempt = 1; attempt <= 5; attempt++) {
+            HeadObjectResponse head = head(key);
+            if (head.contentLength() == size) {
+                String etag = head.eTag();
+                if (etag == null || etag.contains("-")
+                        || md5Hex(file).equalsIgnoreCase(stripQuotes(etag))) {
+                    return;
+                }
+                failure = new IOException(key + ": checksum mismatch after upload");
+            } else {
+                failure = new IOException(key + ": expected " + size + " bytes but remote object has "
+                        + head.contentLength() + " (remote state may still be propagating)");
+            }
+            try {
+                Thread.sleep(5000L * attempt);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw failure;
+            }
         }
-        String etag = head.eTag();
-        if (etag != null && !etag.contains("-") && !md5Hex(file).equalsIgnoreCase(stripQuotes(etag))) {
-            throw new IOException(key + ": checksum mismatch after upload");
-        }
+        throw failure;
     }
 
     private void download(String key, Path destination) throws IOException {

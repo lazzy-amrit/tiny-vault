@@ -38,6 +38,8 @@ A Java 25 toolchain is provisioned automatically by Gradle. Output:
    - `region` — FileLu's documented default is `global`; endpoint-specific
      values are `us-east`, `eu-central`, `ap-southeast`, `me-central`
    - `timer` — backup interval, read as hours (default 24)
+   - `timezone` — IANA zone for command output (default `Asia/Kolkata`),
+     e.g. `Asia/Dhaka`, `Europe/Berlin`, `UTC`
    Keep this file private — it contains credentials.
 3. Restart the server.
 

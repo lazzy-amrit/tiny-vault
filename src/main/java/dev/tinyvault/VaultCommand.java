@@ -16,21 +16,32 @@ import java.util.Locale;
 import java.util.Map;
 
 /**
- * /vault command family.
+ * /vault command family with structured, newest-first output.
  * - detail: open to everyone, as proof that backups are being made.
  * - back / list / fails / passes: operator only.
+ * Times are shown in the zone configured under `timezone` (default Asia/Kolkata).
  */
 final class VaultCommand implements CommandExecutor, TabCompleter {
     private static final List<String> SUBCOMMANDS = List.of("detail", "back", "list", "fails", "passes");
-    private static final DateTimeFormatter TIME_FORMAT =
-            DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault());
 
     private final TinyVaultPlugin plugin;
     private final BackupCoordinator coordinator;
+    private final ZoneId zone;
+    private final DateTimeFormatter fullTime;
+    private final DateTimeFormatter dayTime;
 
     VaultCommand(TinyVaultPlugin plugin, BackupCoordinator coordinator) {
         this.plugin = plugin;
         this.coordinator = coordinator;
+        ZoneId parsed;
+        try {
+            parsed = ZoneId.of(plugin.getConfig().getString("timezone", "Asia/Kolkata").strip());
+        } catch (Exception e) {
+            parsed = ZoneId.of("Asia/Kolkata");
+        }
+        this.zone = parsed;
+        this.fullTime = DateTimeFormatter.ofPattern("dd MMM yyyy, HH:mm z", Locale.ENGLISH).withZone(zone);
+        this.dayTime = DateTimeFormatter.ofPattern("HH:mm z", Locale.ENGLISH).withZone(zone);
     }
 
     @Override
@@ -77,99 +88,126 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
     }
 
     private void sendUsage(CommandSender sender) {
-        sender.sendMessage("Usage: /vault <detail|back|list|fails|passes> (last four are operator only)");
+        sender.sendMessage("Usage: /vault <detail|back|list|fails|passes> (back, list, fails, passes are operator only)");
     }
 
     private boolean requireOperator(CommandSender sender) {
         if (sender.isOp() || sender.hasPermission("tinyvault.admin")) {
             return true;
         }
-        sender.sendMessage("This subcommand is operator only.");
+        sender.sendMessage("[TinyVault] This subcommand is operator only.");
         return false;
     }
 
-    /** Proof for anyone: remote backup sizes plus the state summary. Network work runs async. */
+    private String header(String title) {
+        return "----[ TinyVault · " + title + " ]----";
+    }
+
+    private String field(String label, String value) {
+        return String.format(Locale.ROOT, " %-15s %s", label, value);
+    }
+
+    private String sizeText(Long size) {
+        return size == null ? "missing" : String.format(Locale.ROOT, "%.1f MiB", size / 1024.0 / 1024.0);
+    }
+
+    private String markerFor(int index) {
+        return index == 1 ? "  <- latest" : "";
+    }
+
+    /* ---- detail (open to everyone) ---- */
+
     private void showDetail(CommandSender sender) {
         BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
         new BukkitRunnable() {
             @Override
             public void run() {
-                sender.sendMessage("[TinyVault] Backup status");
                 Map<String, Long> sizes = coordinator.store().backupSizes();
-                sender.sendMessage(describeObject("current.zip (latest)",
-                        sizes.get(S3BackupStore.PREFIX + "current.zip")));
-                sender.sendMessage(describeObject("old.zip (previous)",
-                        sizes.get(S3BackupStore.PREFIX + "old.zip")));
-                sender.sendMessage("last success: " + (snapshot.lastSuccess() == null
-                        ? "never"
-                        : TIME_FORMAT.format(snapshot.lastSuccess()) + " (status " + snapshot.currentStatus() + ")"));
+                long recentFailedCount = snapshot.failures().stream()
+                        .filter(entry -> parseTime(entry).isAfter(Instant.now().minus(Duration.ofHours(48))))
+                        .count();
                 Instant nextDue = coordinator.nextDue();
-                sender.sendMessage("next backup due: " + (nextDue.equals(Instant.EPOCH)
-                        ? "now (overdue)" : TIME_FORMAT.format(nextDue)));
-                if (coordinator.backupRunning()) {
-                    sender.sendMessage("a backup is running right now");
-                }
-                sender.sendMessage("recorded failures: " + snapshot.failures().size()
-                        + " (use /vault fails for the last 48h)");
+
+                sender.sendMessage(header("backup status"));
+                sender.sendMessage(field("timezone:", zone.toString()));
+                sender.sendMessage(field("current.zip:", sizeText(sizes.get(S3BackupStore.PREFIX + "current.zip")) + "  (latest)"));
+                sender.sendMessage(field("old.zip:", sizeText(sizes.get(S3BackupStore.PREFIX + "old.zip")) + "  (previous)"));
+                sender.sendMessage(field("last success:", snapshot.lastSuccess() == null
+                        ? "never" : fullTime.format(snapshot.lastSuccess())));
+                sender.sendMessage(field("status:", snapshot.currentStatus()
+                        + (coordinator.backupRunning() ? " · a backup is running right now" : "")));
+                sender.sendMessage(field("next due:", nextDue.equals(Instant.EPOCH)
+                        ? "now (overdue)" : fullTime.format(nextDue)));
+                sender.sendMessage(field("failures 48h:", recentFailedCount + "  (recorded total: "
+                        + snapshot.failures().size() + ")"));
             }
         }.runTaskAsynchronously(plugin);
     }
 
-    private String describeObject(String label, Long size) {
-        return label + ": " + (size == null
-                ? "missing"
-                : String.format(Locale.ROOT, "%.1f MiB", size / 1024.0 / 1024.0));
-    }
-
     private void startManualBackup(CommandSender sender) {
         if (coordinator.requestManualBackup()) {
-            sender.sendMessage("[TinyVault] Backup started; it is recorded like a scheduled one and the next timer window starts from it.");
+            sender.sendMessage("[TinyVault] Backup started. It is recorded like a scheduled one; the next time window starts from it.");
         } else {
             sender.sendMessage("[TinyVault] A backup is already running.");
         }
     }
 
+    /* ---- list ---- */
+
     private void showList(CommandSender sender) {
         BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
-        ZoneId zone = ZoneId.systemDefault();
         LocalDate today = LocalDate.now(zone);
-        List<String> todayLines = new java.util.ArrayList<>();
-        List<String> olderLines = new java.util.ArrayList<>();
-        for (Instant timestamp : snapshot.successes()) {
-            if (LocalDate.ofInstant(timestamp, zone).equals(today)) {
-                todayLines.add(" - " + TIME_FORMAT.format(timestamp));
-            } else {
-                olderLines.add(" - " + TIME_FORMAT.format(timestamp));
+        sender.sendMessage(header("recorded backups (latest first)"));
+        int index = 1;
+        int todays = 0;
+        for (Instant timestamp : snapshot.successes()) { // newest first
+            boolean isToday = LocalDate.ofInstant(timestamp, zone).equals(today);
+            String when = isToday ? dayTime.format(timestamp) + " (today)" : fullTime.format(timestamp);
+            sender.sendMessage(" " + index + ".  " + when + markerFor(index));
+            if (isToday) {
+                todays++;
             }
+            index++;
         }
-        sender.sendMessage("[TinyVault] Backups today: " + todayLines.size());
-        todayLines.forEach(sender::sendMessage);
-        if (todayLines.isEmpty() && olderLines.isEmpty()) {
-            sender.sendMessage("[TinyVault] No successful backups recorded yet.");
-        } else if (!olderLines.isEmpty()) {
-            sender.sendMessage("[TinyVault] Older recorded backups (only the last 5 are kept):");
-            olderLines.forEach(sender::sendMessage);
+        if (index == 1) {
+            sender.sendMessage(" none yet");
+        }
+        sender.sendMessage(" backups today: " + todays);
+    }
+
+    private void showPasses(CommandSender sender) {
+        BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
+        sender.sendMessage(header("passes (successful backups, latest first)"));
+        if (snapshot.successes().isEmpty()) {
+            sender.sendMessage(" none yet");
+        }
+        int index = 1;
+        for (Instant timestamp : snapshot.successes()) {
+            sender.sendMessage(" " + index + ".  " + fullTime.format(timestamp) + markerFor(index));
+            index++;
         }
     }
 
     private void showFails(CommandSender sender) {
         BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
         Instant cutoff = Instant.now().minus(Duration.ofHours(48));
-        List<String> recent = snapshot.failures().stream()
-                .filter(entry -> parseTime(entry).isAfter(cutoff))
-                .limit(10)
-                .toList();
-        sender.sendMessage("[TinyVault] Failures in the last 48 hours: " + recent.size());
-        recent.forEach(sender::sendMessage);
-    }
-
-    private void showPasses(CommandSender sender) {
-        BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
-        sender.sendMessage("[TinyVault] Successful backups (last 5):");
-        if (snapshot.successes().isEmpty()) {
-            sender.sendMessage(" - none yet");
+        sender.sendMessage(header("failures (last 48h, latest first)"));
+        int index = 1;
+        int recent = 0;
+        for (String failure : snapshot.failures()) { // newest first
+            Instant at = parseTime(failure);
+            if (!at.isAfter(cutoff)) {
+                continue;
+            }
+            recent++;
+            String reason = failure.contains(" | ") ? failure.substring(failure.indexOf(" | ") + 3) : failure;
+            sender.sendMessage(" " + index + ".  " + fullTime.format(at));
+            sender.sendMessage("      reason: " + reason);
+            index++;
         }
-        snapshot.successes().forEach(timestamp -> sender.sendMessage(" - " + TIME_FORMAT.format(timestamp)));
+        if (index == 1) {
+            sender.sendMessage(" none in the last 48 hours");
+        }
     }
 
     private static Instant parseTime(String entry) {

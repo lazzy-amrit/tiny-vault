@@ -29,6 +29,11 @@ path-style: true
 # Hours between backups (number, read as hours; default 24). Example: 4 = every 4 hours.
 timer: 24
 
+# IANA timezone used by /vault commands to display dates and times.
+# Examples: Asia/Kolkata (India), Asia/Dhaka, Europe/Berlin, America/New_York, UTC.
+# Defaults to Asia/Kolkata when missing or invalid.
+timezone: "Asia/Kolkata"
+
 # FileLu account API key (My Account -> API Key -> switch ON). Only used in
 # s5 mode: it lets TinyVault purge deleted backups from FileLu's trash after
 # rotation, so trash contents don't trigger "storage full". Leave empty to
