@@ -34,6 +34,10 @@ timer: 24
 # Defaults to Asia/Kolkata when missing or invalid.
 timezone: "Asia/Kolkata"
 
+# Clock style for /vault command output: "24" for 24-hour format, "12" for
+# 12-hour format with AM/PM. Defaults to 24 when missing or invalid.
+time-format: "24"
+
 # FileLu account API key (My Account -> API Key -> switch ON). Only used in
 # s5 mode: it lets TinyVault purge deleted backups from FileLu's trash after
 # rotation, so trash contents don't trigger "storage full". Leave empty to

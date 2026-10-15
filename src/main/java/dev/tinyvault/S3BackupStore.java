@@ -259,24 +259,28 @@ final class S3BackupStore implements AutoCloseable {
 
     private void verifyUpload(String key, Path file, long size) throws IOException {
         // FileLu's gateway is eventually consistent: right after an upload (or
-        // a delete) HEAD can still report the previous object. Re-check a few
-        // times before failing.
+        // a delete) HEAD can report the previous object for minutes. Re-check
+        // patiently before failing; the next scheduled run retries anyway.
         IOException failure = null;
-        for (int attempt = 1; attempt <= 5; attempt++) {
-            HeadObjectResponse head = head(key);
-            if (head.contentLength() == size) {
-                String etag = head.eTag();
-                if (etag == null || etag.contains("-")
-                        || md5Hex(file).equalsIgnoreCase(stripQuotes(etag))) {
-                    return;
+        for (int attempt = 1; attempt <= 10; attempt++) {
+            try {
+                HeadObjectResponse head = head(key);
+                if (head.contentLength() == size) {
+                    String etag = head.eTag();
+                    if (etag == null || etag.contains("-")
+                            || md5Hex(file).equalsIgnoreCase(stripQuotes(etag))) {
+                        return;
+                    }
+                    failure = new IOException(key + ": checksum mismatch after upload");
+                } else {
+                    failure = new IOException(key + ": expected " + size + " bytes but remote object has "
+                            + head.contentLength() + " (remote state may still be propagating)");
                 }
-                failure = new IOException(key + ": checksum mismatch after upload");
-            } else {
-                failure = new IOException(key + ": expected " + size + " bytes but remote object has "
-                        + head.contentLength() + " (remote state may still be propagating)");
+            } catch (NoSuchKeyException e) {
+                failure = new IOException(key + ": temporarily not readable after upload (propagation)", e);
             }
             try {
-                Thread.sleep(5000L * attempt);
+                Thread.sleep(20_000L);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw failure;

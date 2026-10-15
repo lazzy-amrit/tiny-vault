@@ -40,8 +40,14 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             parsed = ZoneId.of("Asia/Kolkata");
         }
         this.zone = parsed;
-        this.fullTime = DateTimeFormatter.ofPattern("dd MMM yyyy, HH:mm z", Locale.ENGLISH).withZone(zone);
-        this.dayTime = DateTimeFormatter.ofPattern("HH:mm z", Locale.ENGLISH).withZone(zone);
+        boolean twelveHour = "12".equalsIgnoreCase(
+                plugin.getConfig().getString("time-format", "24").strip());
+        this.fullTime = DateTimeFormatter
+                .ofPattern(twelveHour ? "dd MMM yyyy, hh:mm a z" : "dd MMM yyyy, HH:mm z", Locale.ENGLISH)
+                .withZone(zone);
+        this.dayTime = DateTimeFormatter
+                .ofPattern(twelveHour ? "hh:mm a z" : "HH:mm z", Locale.ENGLISH)
+                .withZone(zone);
     }
 
     @Override
@@ -145,11 +151,62 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
     }
 
     private void startManualBackup(CommandSender sender) {
-        if (coordinator.requestManualBackup()) {
-            sender.sendMessage("[TinyVault] Backup started. It is recorded like a scheduled one; the next time window starts from it.");
-        } else {
+        if (!coordinator.requestManualBackup()) {
             sender.sendMessage("[TinyVault] A backup is already running.");
+            return;
         }
+        Instant previousLastSuccess = coordinator.state().lastSuccess();
+        sender.sendMessage("[TinyVault] Backup started — progress updates follow.");
+        new BukkitRunnable() {
+            private BackupCoordinator.Phase lastAnnounced = BackupCoordinator.Phase.IDLE;
+            private boolean sawRunning = false;
+            private int ticksElapsed = 0;
+
+            @Override
+            public void run() {
+                ticksElapsed += 40L; // 2s period
+                BackupCoordinator.Phase phase = coordinator.phase();
+                boolean running = coordinator.backupRunning();
+                if (running || phase != BackupCoordinator.Phase.IDLE) {
+                    sawRunning = true;
+                }
+                if (phase != lastAnnounced && phase != BackupCoordinator.Phase.IDLE) {
+                    sender.sendMessage(" " + phaseText(phase));
+                    lastAnnounced = phase;
+                }
+                if (sawRunning && !running && phase == BackupCoordinator.Phase.IDLE) {
+                    finishReport(previousLastSuccess);
+                    cancel();
+                    return;
+                }
+            }
+
+            private String phaseText(BackupCoordinator.Phase phase) {
+                return switch (phase) {
+                    case SAVING -> "saving worlds (autosave paused)…";
+                    case ARCHIVING -> "compressing the server into one ZIP…";
+                    case UPLOADING -> "uploading to storage (large archives take several minutes)…";
+                    default -> "";
+                };
+            }
+
+            private void finishReport(Instant baseline) {
+                BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
+                if (snapshot.lastSuccess() != null && !snapshot.lastSuccess().equals(baseline)) {
+                    sender.sendMessage("[TinyVault] Backup completed and recorded at "
+                            + fullTime.format(snapshot.lastSuccess()) + ".");
+                } else {
+                    String reason = !snapshot.failures().isEmpty()
+                            ? snapshot.failures().get(0)
+                            : "unknown reason";
+                    if (reason.contains(" | ")) {
+                        reason = reason.substring(reason.indexOf(" | ") + 3);
+                    }
+                    sender.sendMessage("[TinyVault] Backup FAILED — reason: " + reason);
+                    sender.sendMessage("           Your existing backups were preserved; the next scheduled run will retry.");
+                }
+            }
+        }.runTaskTimerAsynchronously(plugin, 0L, 40L);
     }
 
     /* ---- list ---- */

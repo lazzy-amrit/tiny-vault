@@ -27,6 +27,9 @@ final class BackupCoordinator {
     private static final long CHECK_PERIOD_TICKS = 20L * 60 * 5;
     private static final int DEFAULT_TIMER_HOURS = 24;
 
+    /** Progress phases surfaced to the /vault back command. */
+    enum Phase { IDLE, SAVING, ARCHIVING, UPLOADING }
+
     private final Plugin plugin;
     private final S3BackupStore store;
     private final ServerArchiver archiver;
@@ -35,6 +38,7 @@ final class BackupCoordinator {
     private final boolean fileLuMode;
     private final Path tempDir;
     private final AtomicBoolean running = new AtomicBoolean();
+    private volatile Phase phase = Phase.IDLE;
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "TinyVault-backup");
         thread.setDaemon(true);
@@ -162,10 +166,15 @@ final class BackupCoordinator {
         }
     }
 
+    Phase phase() {
+        return phase;
+    }
+
     private void runBackup() {
         Instant startedAt = Instant.now();
         Path archive = tempDir.resolve("backup-" + startedAt.toEpochMilli() + ".zip.part");
         try {
+            phase = Phase.SAVING;
             awaitOnMainThread(() -> {
                 for (World world : Bukkit.getWorlds()) {
                     world.setAutoSave(false);
@@ -176,6 +185,7 @@ final class BackupCoordinator {
                 Bukkit.savePlayers();
             });
             try {
+                phase = Phase.ARCHIVING;
                 archiver.createArchive(archive);
             } finally {
                 awaitOnMainThread(() -> {
@@ -185,6 +195,7 @@ final class BackupCoordinator {
                 });
             }
 
+            phase = Phase.UPLOADING;
             store.rotate(archive, Files.size(archive));
             state.recordSuccess(startedAt);
             plugin.getLogger().info(String.format(
@@ -201,6 +212,7 @@ final class BackupCoordinator {
                 plugin.getLogger().warning("Could not update backup state file: " + stateError.getMessage());
             }
         } finally {
+            phase = Phase.IDLE;
             try {
                 Files.deleteIfExists(archive);
             } catch (IOException ignored) {
