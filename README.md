@@ -1,8 +1,12 @@
 # TinyVault
 
 Minimal Paper plugin that backs up the entire server directory to FileLu S5
-(S3-compatible) object storage every 24 hours and keeps exactly one remote
-backup: `backups/current.zip`.
+(S3-compatible) object storage and keeps exactly two remote ZIP archives:
+
+- `backups/current.zip` — latest successful backup
+- `backups/last.zip` — previous successful backup
+
+Backups run every `timer` hours (by default 24).
 
 ## Requirements
 
@@ -17,7 +21,7 @@ gradle shadowJar
 ```
 
 A Java 25 toolchain is provisioned automatically by Gradle. Output:
-`build/libs/TinyVault-1.jar`.
+`build/libs/TinyVault-1.0.1.jar`.
 
 ## Install
 
@@ -33,36 +37,39 @@ A Java 25 toolchain is provisioned automatically by Gradle. Output:
      `https://s5lu.com`)
    - `region` — FileLu's documented default is `global`; endpoint-specific
      values are `us-east`, `eu-central`, `ap-southeast`, `me-central`
+   - `timer` — backup interval, read as hours (default 24)
    Keep this file private — it contains credentials.
 3. Restart the server.
 
 ## Behavior
 
-- On startup the plugin reads `plugins/TinyVault/state.txt`. If the 24-hour
+- On startup the plugin reads `plugins/TinyVault/state.txt`. If the `timer`
   deadline of the last successful backup is already overdue, a backup starts
   immediately; otherwise it runs when the deadline passes (checked every five
   minutes, so it never backs up early and catches up right after the deadline).
 - Each run: all worlds and player data are saved on the main thread (autosave
   is paused while the archive is written and restored afterwards), then the
   whole server directory — excluding TinyVault's own folder, which holds the
-  state file, config and temp archive — is streamed into one ZIP.
-- Upload policy (one remote backup only):
-  1. The ZIP is uploaded to `backups/uploading.zip` and verified (size and
-     checksum).
-  2. Only after the temp upload is confirmed is the old `backups/current.zip`
-     deleted, and the confirmed archive is uploaded to
-     `backups/current.zip` and verified again.
-  3. The temp object is removed. A failed or interrupted upload leaves the
-     existing `current.zip` untouched.
+  state file, config and temp archives — is streamed into one ZIP.
+- Two-slot rotation per run:
+  1. `backups/last.zip` (the oldest) is deleted first to make room.
+  2. If `backups/current.zip` exists, it is downloaded to a local temp file.
+  3. The new ZIP is uploaded straight to `backups/current.zip` and verified
+     (multipart PUTs are atomic: a failed upload leaves the old object intact).
+  4. The downloaded copy is uploaded to `backups/last.zip` and verified.
+  There is no remote temp object — nothing like `uploading.zip` is created, so
+  nothing lingers in your FileLu bucket or trash between runs (old leftovers
+  from previous plugin versions are cleaned up automatically at the next run).
+  A failed run leaves any surviving backup untouched.
 - Archives larger than 64 MiB are uploaded as S3 multipart (64 MiB parts, up
   to three in parallel) because FileLu's gateway rejects long single-request
   PUTs. Interrupted uploads are aborted immediately, and any leftover
   multipart uploads are aborted at the start of the next run so partial parts
   never consume quota. For multipart objects the checksum check falls back to
   size-only (multipart ETags are not MD5).
-- FileLu S5's documented feature set does not include server-side CopyObject,
-  so promotion is a second upload of the same local file rather than a copy or
-  rename. Only the universally supported PUT / HEAD / DELETE operations are
+- FileLu S5's gateway does not support server-side CopyObject (returns 500),
+  so the previous backup is preserved by downloading it locally during the
+  run and re-uploading it to `last.zip`. Only PUT / HEAD / GET / DELETE are
   used, with path-style addressing.
 - `state.txt` keeps the last 5 successful timestamps, the last 10 failures
   with brief reasons, and the current status under `#Timestamps`, `#failures`
@@ -71,17 +78,21 @@ A Java 25 toolchain is provisioned automatically by Gradle. Output:
 - All archive and upload work runs off the main thread. Temporary archives
   live in `plugins/TinyVault/tmp/` and are deleted after every attempt.
 
-## Storage quota trade-off
+## Storage quota and FileLu trash warning
 
-FileLu S5 quota is shared per bucket/folder (1 GB by default on typical plans)
-and the S3 API has no atomic rename, so while a new archive uploads, the old
-`current.zip` and the `backups/uploading.zip` temp object coexist
-simultaneously. With the current ~350 MB archive that is ~700 MB of the 1 GB
-quota, which fits. If your archive grows beyond roughly half the free quota,
-the temp upload will fail with a quota error; TinyVault then keeps the existing
-`current.zip` intact, records the failure in `state.txt`, and logs it. It never
-deletes the only valid backup to make room for an unverified replacement — if
-you hit this, raise the quota or reduce the server data size.
+FileLu S5 quota is shared per bucket/folder (1 GB by default on typical plans).
+At any moment during rotation at most two archives exist remotely:
+2 x ~370 MB = ~740 MB of the 1 GB quota. If your archive grows beyond roughly
+half the free quota, the rotation will fail with a quota error; TinyVault then
+reports the failure, keeps the surviving backups, and retries at the next
+deadline — it never deletes the only valid backup to make room.
+
+**FileLu trash:** every S3 DELETE lands in FileLu's trash (deleted backups
+are re-sent from there if you need recovery). If FileLu counts trash contents
+against your quota, empty the trash from the FileLu web UI periodically — the
+S3 API cannot purge it. TinyVault deletes are conditional (existing objects
+only) and never create random leftover objects, so trash entries come only
+from intentional rotations (one per run: the oldest backup).
 
 ## Limits
 

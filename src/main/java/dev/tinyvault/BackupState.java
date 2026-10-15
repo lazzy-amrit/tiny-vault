@@ -10,6 +10,7 @@ import java.time.Instant;
 import java.time.format.DateTimeParseException;
 import java.util.ArrayDeque;
 import java.util.Deque;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -68,6 +69,20 @@ final class BackupState {
     /** Most recent successful backup timestamp, or null if there never was one. */
     synchronized Instant lastSuccess() {
         return successes.peekFirst();
+    }
+
+    /** Current status as recorded in the #current section ("OK", "FAILED" or "NONE"). */
+    synchronized String currentStatus() {
+        return currentStatus;
+    }
+
+    /** Immutable snapshot of all recorded state for status commands. */
+    synchronized StateSnapshot snapshot() {
+        Instant latest = successes.peekFirst();
+        return new StateSnapshot(List.copyOf(successes), List.copyOf(failures), latest, currentStatus);
+    }
+
+    record StateSnapshot(List<Instant> successes, List<String> failures, Instant lastSuccess, String currentStatus) {
     }
 
     /** Called only after the upload to S3 completed and was verified. */

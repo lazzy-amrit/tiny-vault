@@ -24,13 +24,15 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * immediately. Only one backup ever runs at a time.
  */
 final class BackupCoordinator {
-    private static final Duration BACKUP_INTERVAL = Duration.ofHours(24);
     private static final long CHECK_PERIOD_TICKS = 20L * 60 * 5;
+    private static final int DEFAULT_TIMER_HOURS = 24;
 
     private final Plugin plugin;
     private final S3BackupStore store;
     private final ServerArchiver archiver;
     private final BackupState state;
+    private final Duration backupInterval;
+    private final boolean fileLuMode;
     private final Path tempDir;
     private final AtomicBoolean running = new AtomicBoolean();
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
@@ -40,11 +42,14 @@ final class BackupCoordinator {
     });
     private BukkitTask checkTask;
 
-    private BackupCoordinator(Plugin plugin, S3BackupStore store, ServerArchiver archiver, BackupState state) {
+    private BackupCoordinator(Plugin plugin, S3BackupStore store, ServerArchiver archiver, BackupState state,
+                              Duration backupInterval, boolean fileLuMode) {
         this.plugin = plugin;
         this.store = store;
         this.archiver = archiver;
         this.state = state;
+        this.backupInterval = backupInterval;
+        this.fileLuMode = fileLuMode;
         this.tempDir = plugin.getDataFolder().toPath().resolve("tmp");
     }
 
@@ -59,12 +64,21 @@ final class BackupCoordinator {
         String endpoint = config.getString("endpoint", "https://ap.s5lu.com").strip();
         String region = config.getString("region", "global").strip();
         boolean pathStyle = config.getBoolean("path-style", true);
+        String mode = config.getString("mode", "s3").strip();
+        boolean fileLuMode = mode.equalsIgnoreCase("s5");
+        String apiKey = config.getString("api-key", "");
+        FileLuTrashPurger trashPurger = fileLuMode
+                ? new FileLuTrashPurger(apiKey, message -> plugin.getLogger().warning(message))
+                : new FileLuTrashPurger("", null);
+        int timerHours = config.getInt("timer", DEFAULT_TIMER_HOURS);
+        Duration backupInterval = Duration.ofHours(timerHours < 1 ? DEFAULT_TIMER_HOURS : timerHours);
 
         BackupState state = new BackupState(plugin.getDataFolder().toPath().resolve("state.txt"));
         state.load();
-        S3BackupStore store = new S3BackupStore(endpoint, region, pathStyle, bucket, accessKey, secretKey);
+        S3BackupStore store = new S3BackupStore(endpoint, region, pathStyle, bucket, accessKey, secretKey,
+                fileLuMode, trashPurger);
         ServerArchiver archiver = new ServerArchiver(serverRoot(plugin), plugin.getDataFolder().toPath());
-        return new BackupCoordinator(plugin, store, archiver, state);
+        return new BackupCoordinator(plugin, store, archiver, state, backupInterval, fileLuMode);
     }
 
     /**
@@ -85,14 +99,53 @@ final class BackupCoordinator {
     void start() {
         Instant last = state.lastSuccess();
         Instant due = nextDue(last);
+        plugin.getLogger().info("Rotation mode: " + (fileLuMode ? "s5 (FileLu)" : "s3 (universal)"));
         plugin.getLogger().info(last == null
                 ? "No previous backup found; a backup will start now"
                 : "Last successful backup " + last + "; next backup due " + due);
         checkTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::check, 20L, CHECK_PERIOD_TICKS);
     }
 
-    private static Instant nextDue(Instant lastSuccess) {
-        return lastSuccess == null ? Instant.EPOCH : lastSuccess.plus(BACKUP_INTERVAL);
+    BackupState state() {
+        return state;
+    }
+
+    S3BackupStore store() {
+        return store;
+    }
+
+    Instant nextDue() {
+        return nextDue(state.lastSuccess());
+    }
+
+    Duration backupInterval() {
+        return backupInterval;
+    }
+
+    /**
+     * Runs one backup immediately, recording it like any scheduled one (the
+     * next deadline is measured from this backup's success). Returns false if
+     * a backup is already running.
+     */
+    boolean requestManualBackup() {
+        if (running.get() || !running.compareAndSet(false, true)) {
+            return false;
+        }
+        try {
+            worker.execute(this::runBackup);
+            return true;
+        } catch (RejectedExecutionException e) {
+            running.set(false);
+            return false;
+        }
+    }
+
+    boolean backupRunning() {
+        return running.get();
+    }
+
+    private Instant nextDue(Instant lastSuccess) {
+        return lastSuccess == null ? Instant.EPOCH : lastSuccess.plus(backupInterval);
     }
 
     private void check() {

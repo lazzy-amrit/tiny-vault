@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "dev.tinyvault"
-version = "1"
+version = "1.0.1"
 
 java {
     toolchain {

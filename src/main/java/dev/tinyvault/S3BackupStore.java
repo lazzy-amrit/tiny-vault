@@ -12,9 +12,11 @@ import software.amazon.awssdk.services.s3.model.AbortMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompleteMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CompletedMultipartUpload;
 import software.amazon.awssdk.services.s3.model.CompletedPart;
+import software.amazon.awssdk.services.s3.model.CopyObjectRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadRequest;
 import software.amazon.awssdk.services.s3.model.CreateMultipartUploadResponse;
 import software.amazon.awssdk.services.s3.model.DeleteObjectRequest;
+import software.amazon.awssdk.services.s3.model.GetObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.HeadObjectResponse;
 import software.amazon.awssdk.services.s3.model.ListMultipartUploadsRequest;
@@ -30,43 +32,57 @@ import java.io.InputStream;
 import java.net.URI;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 
 /**
- * Minimal FileLu S5 storage handling. The bucket holds exactly one backup plus
- * one short-lived upload slot:
+ * Storage rotation keeping exactly two remote backups:
  *
  * <pre>
- * backups/current.zip    latest verified backup
- * backups/uploading.zip  temp upload target, deleted after every attempt
+ * backups/current.zip   latest successful backup
+ * backups/old.zip       previous successful backup
  * </pre>
  *
- * The new archive is uploaded to the temp slot and verified before the old
- * current.zip is touched, so a failed or interrupted run always leaves the
- * existing backup intact. FileLu S5 does not document server-side copy, so
- * promotion is a fresh upload of the same local file. Large archives are sent
- * as multipart uploads (FileLu's gateway rejects long single-request PUTs),
- * and interrupted uploads are aborted so their parts never consume quota.
+ * Rotation per run, in this order:
+ * <ol>
+ * <li>the oldest slot (old.zip) is deleted first — and, in s5 mode, its trash
+ *     entry is purged immediately so the freed space is actually usable;</li>
+ * <li>the previous current.zip is preserved: s3 mode uses server-side
+ *     CopyObject, s5 mode (FileLu) has no working copy, so the previous
+ *     current.zip is downloaded to a local temp file;</li>
+ * <li>the new archive is uploaded straight to current.zip (multipart uploads
+ *     are atomic: a failed upload leaves the old object in place) and
+ *     verified;</li>
+ * <li>the preserved copy becomes the new old.zip and is verified.</li>
+ * </ol>
+ * There is no remote temp object, so nothing lingers between runs. A failed
+ * run leaves any surviving backup untouched.
  */
 final class S3BackupStore implements AutoCloseable {
     static final String PREFIX = "backups/";
-    private static final String TEMP_KEY = PREFIX + "uploading.zip";
+    private static final String LEGACY_TEMP_KEY = PREFIX + "uploading.zip";
     private static final String CURRENT_KEY = PREFIX + "current.zip";
+    private static final String OLD_KEY = PREFIX + "old.zip";
     private static final long PART_SIZE = 64L * 1024 * 1024;
     private static final int MAX_PARALLEL_PARTS = 3;
 
     private final S3Client s3;
     private final String bucket;
+    private final boolean fileLuMode;
+    private final FileLuTrashPurger trashPurger;
 
-    S3BackupStore(String endpoint, String region, boolean pathStyle, String bucket, String accessKey, String secretKey) {
+    S3BackupStore(String endpoint, String region, boolean pathStyle, String bucket, String accessKey, String secretKey,
+                  boolean fileLuMode, FileLuTrashPurger trashPurger) {
         S3ClientBuilder builder = S3Client.builder()
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)))
@@ -77,26 +93,67 @@ final class S3BackupStore implements AutoCloseable {
         }
         this.s3 = builder.build();
         this.bucket = bucket;
+        this.fileLuMode = fileLuMode;
+        this.trashPurger = trashPurger;
     }
 
-    /**
-     * Uploads the archive to uploading.zip and verifies it (size + checksum).
-     * Only then is the old current.zip removed and the confirmed archive
-     * promoted to current.zip, followed by a final verification. Throws if any
-     * step fails; existing backups are only replaced after the replacement is
-     * confirmed.
-     */
     void rotate(Path archive, long size) throws IOException {
-        deleteQuietly(TEMP_KEY);
+        deleteIfPresent(LEGACY_TEMP_KEY); // leftovers from older plugin versions
         abortStaleUploads();
-        upload(TEMP_KEY, archive);
-        verifyUpload(TEMP_KEY, archive, size);
+        if (fileLuMode) {
+            trashPurger.purgeBackupNames();
+        }
+        deleteIfPresent(OLD_KEY);
+        if (fileLuMode) {
+            trashPurger.purgeBackupNames(); // immediately free the space old.zip just moved to trash
+        }
 
-        deleteQuietly(CURRENT_KEY);
-        upload(CURRENT_KEY, archive);
-        verifyUpload(CURRENT_KEY, archive, size);
-        deleteQuietly(TEMP_KEY);
+        Path previous = archive.resolveSibling("previous.zip");
+        try {
+            if (objectExists(CURRENT_KEY)) {
+                if (fileLuMode) {
+                    download(CURRENT_KEY, previous);
+                } else {
+                    s3.copyObject(CopyObjectRequest.builder()
+                            .bucket(bucket)
+                            .copySource(bucket + "/" + CURRENT_KEY)
+                            .destinationBucket(bucket)
+                            .destinationKey(OLD_KEY)
+                            .build());
+                }
+            }
+            upload(CURRENT_KEY, archive);
+            verifyUpload(CURRENT_KEY, archive, size);
+            if (Files.exists(previous)) {
+                long previousSize = Files.size(previous);
+                upload(OLD_KEY, previous);
+                verifyUpload(OLD_KEY, previous, previousSize);
+            }
+        } finally {
+            try {
+                Files.deleteIfExists(previous);
+            } catch (IOException ignored) {
+                // temp file lives inside TinyVault's data folder and is excluded from archives
+            }
+        }
     }
+
+    /** Sizes of the two backup objects for the /vault detail command; null when absent. */
+    Map<String, Long> backupSizes() {
+        Map<String, Long> sizes = new LinkedHashMap<>();
+        for (String key : new String[]{CURRENT_KEY, OLD_KEY}) {
+            Long size = null;
+            try {
+                size = head(key).contentLength();
+            } catch (NoSuchKeyException ignored) {
+            } catch (Exception ignored) {
+            }
+            sizes.put(key, size);
+        }
+        return sizes;
+    }
+
+    /* ---- upload ---- */
 
     private void upload(String key, Path file) throws IOException {
         long size = Files.size(file);
@@ -198,6 +255,8 @@ final class S3BackupStore implements AutoCloseable {
         }
     }
 
+    /* ---- verification and small operations ---- */
+
     private void verifyUpload(String key, Path file, long size) throws IOException {
         HeadObjectResponse head = head(key);
         if (head.contentLength() != size) {
@@ -209,15 +268,36 @@ final class S3BackupStore implements AutoCloseable {
         }
     }
 
+    private void download(String key, Path destination) throws IOException {
+        try (var object = s3.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build())) {
+            Files.copy(object, destination, StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
     private HeadObjectResponse head(String key) {
         return s3.headObject(HeadObjectRequest.builder().bucket(bucket).key(key).build());
     }
 
-    private void deleteQuietly(String key) {
+    private boolean objectExists(String key) {
         try {
-            s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
-        } catch (NoSuchKeyException ignored) {
-            // already absent
+            head(key);
+            return true;
+        } catch (NoSuchKeyException e) {
+            return false;
+        }
+    }
+
+    /**
+     * Conditional delete: only removes an object that exists, so absent keys
+     * never produce pointless trash entries on FileLu.
+     */
+    private void deleteIfPresent(String key) {
+        if (objectExists(key)) {
+            try {
+                s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
+            } catch (NoSuchKeyException ignored) {
+                // removed concurrently
+            }
         }
     }
 

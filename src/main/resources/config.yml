@@ -1,5 +1,14 @@
 # TinyVault configuration.
 # Keep this file private: it contains storage credentials.
+# NOTE: `timer` only affects the periodic backup scheduling. The value is a
+# plain number and is read as HOURS; it defaults to 24 when missing or invalid.
+
+# mode: "s3" is the universal default for standard S3-compatible providers
+# (uses server-side CopyObject for the rotation). "s5" is for FileLu S5,
+# whose gateway has no working CopyObject and whose deleted objects land in
+# FileLu's trash — s5 mode downloads the previous backup locally instead and
+# purges trash entries so they don't consume quota.
+mode: "s3"
 
 # FileLu S5 endpoint. Regional hosts: https://ap.s5lu.com (Asia Pacific),
 # https://us.s5lu.com, https://eu.s5lu.com, https://me.s5lu.com, or the global
@@ -16,6 +25,15 @@ region: "global"
 
 # FileLu S5 uses path-style addressing.
 path-style: true
+
+# Hours between backups (number, read as hours; default 24). Example: 4 = every 4 hours.
+timer: 24
+
+# FileLu account API key (My Account -> API Key -> switch ON). Only used in
+# s5 mode: it lets TinyVault purge deleted backups from FileLu's trash after
+# rotation, so trash contents don't trigger "storage full". Leave empty to
+# skip trash purging.
+api-key: ""
 
 # S5 credentials from My Account on filelu.com.
 access-key: ""

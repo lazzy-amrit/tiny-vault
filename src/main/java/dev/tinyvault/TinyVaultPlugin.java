@@ -10,11 +10,17 @@ public final class TinyVaultPlugin extends JavaPlugin {
         saveDefaultConfig();
         try {
             coordinator = BackupCoordinator.create(this);
-            coordinator.start();
         } catch (Exception e) {
             getLogger().severe("Could not start backups: " + e.getMessage());
             coordinator = null;
             getServer().getPluginManager().disablePlugin(this);
+            return;
+        }
+        coordinator.start();
+        if (getCommand("vault") != null) {
+            VaultCommand vaultCommand = new VaultCommand(this, coordinator);
+            getCommand("vault").setExecutor(vaultCommand);
+            getCommand("vault").setTabCompleter(vaultCommand);
         }
     }
 
