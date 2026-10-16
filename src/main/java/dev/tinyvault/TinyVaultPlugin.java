@@ -11,7 +11,8 @@ public final class TinyVaultPlugin extends JavaPlugin {
         try {
             coordinator = BackupCoordinator.create(this);
         } catch (Exception e) {
-            getLogger().severe("Could not start backups: " + e.getMessage());
+            getLogger().severe("Could not start backups: " + e);
+            getLogger().severe("Fix the problem described above in plugins/TinyVault/config.yml, then restart the server.");
             coordinator = null;
             getServer().getPluginManager().disablePlugin(this);
             return;

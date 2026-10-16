@@ -92,7 +92,14 @@ final class BackupCoordinator {
         if (bucket.isBlank() || accessKey.isBlank() || secretKey.isBlank()) {
             throw new IllegalStateException("bucket, access-key and secret-key must be set in plugins/TinyVault/config.yml");
         }
-        String endpoint = config.getString("endpoint", "https://ap.s5lu.com").strip();
+        String endpoint = sanitizeUrl(config.getString("endpoint", "https://ap.s5lu.com"));
+        if (endpoint.isBlank()) {
+            endpoint = "https://ap.s5lu.com";
+        }
+        if (!endpoint.matches("https?://[^\\s]+")) {
+            throw new IllegalStateException("endpoint in config.yml looks invalid ('" + endpoint
+                    + "') — it must look like https://ap.s5lu.com (check for stray quotes around the value)");
+        }
         String region = config.getString("region", "global").strip();
         boolean pathStyle = config.getBoolean("path-style", true);
         String mode = config.getString("mode", "s3").strip();
@@ -148,6 +155,15 @@ final class BackupCoordinator {
             return (interval.getSeconds() / 3600) + "h";
         }
         return (interval.getSeconds() / 60) + "m";
+    }
+
+    /**
+     * Config values that were pasted from chat or the console often arrive
+     * wrapped in quotes or commas. Strip those so a copy-paste can't stop the
+     * plugin from starting.
+     */
+    private static String sanitizeUrl(String raw) {
+        return DiscordWebhook.sanitizeWebhookUrl(raw);
     }
 
     /**
@@ -256,12 +272,8 @@ final class BackupCoordinator {
     private void runBackup(Trigger trigger) {
         Instant startedAt = Instant.now();
         Path archive = tempDir.resolve("backup-" + startedAt.toEpochMilli() + ".zip.part");
-        webhook.started(trigger, startedAt, switch (trigger) {
-            case SCHEDULED -> "a whole-server backup is running (every " + formatInterval(backupInterval) + ")";
-            case MANUAL -> "a whole-server backup is running (started with /vault back)";
-            case SHUTDOWN -> "the server is stopping — final whole-server backup before it does";
-            case STARTUP -> "startup protection — no backup existed yet, creating one now";
-        });
+        webhook.started(trigger, startedAt,
+                (trigger == Trigger.SCHEDULED || trigger == Trigger.MANUAL) ? formatInterval(backupInterval) : null);
         try {
             phase = Phase.SAVING;
             awaitOnMainThread(() -> {
@@ -285,18 +297,18 @@ final class BackupCoordinator {
             }
 
             phase = Phase.UPLOADING;
-            store.rotate(archive, Files.size(archive));
+            store.rotate(archive, Files.size(archive), startedAt);
             state.recordSuccess(startedAt);
             long archiveSize = Files.size(archive);
             plugin.getLogger().info(String.format(
-                    "Backup completed in %ds (%.1f MiB) -> %scurrent.zip",
+                    "Backup completed in %ds (%.1f MiB) — newest backup is %stv-%d.zip",
                     Duration.between(startedAt, Instant.now()).toSeconds(),
                     archiveSize / 1024.0 / 1024.0,
-                    S3BackupStore.PREFIX));
-            String nextNote = extreme
-                    ? "the next backup finishes at the next server shutdown"
-                    : ("next one due " + nextDue(startedAt) + " (" + formatInterval(backupInterval) + ")");
-            webhook.success(startedAt, archiveSize, Duration.between(startedAt, Instant.now()), nextNote);
+                    S3BackupStore.PREFIX, startedAt.toEpochMilli()));
+            String nextText = extreme
+                    ? "at the next shutdown"
+                    : "in " + formatInterval(backupInterval);
+            webhook.success(startedAt, archiveSize, Duration.between(startedAt, Instant.now()), nextText);
         } catch (Exception e) {
             String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             plugin.getLogger().warning("Backup failed: " + reason);

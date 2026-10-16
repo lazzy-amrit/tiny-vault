@@ -51,7 +51,7 @@ final class DiscordWebhook {
      * that; anything that is not clearly a webhook URL is rejected instead of
      * being POSTed to Discord (which would answer 400).
      */
-    private static String sanitizeWebhookUrl(String raw) {
+    static String sanitizeWebhookUrl(String raw) {
         if (raw == null) {
             return "";
         }
@@ -66,38 +66,37 @@ final class DiscordWebhook {
         return out;
     }
 
-    /**
-     * Start announcement.
-     *
-     * @param trigger how the backup was started (scheduled, manual, shutdown…)
-     * @param note    one extra line of context, e.g. the interval of the run;
-     *                may be null
-     */
-    void started(BackupCoordinator.Trigger trigger, Instant at, String note) {
-        post(embed(COLOR_STARTED, "Backup started", note, at,
-                new String[][]{{"trigger", trigger.label}}));
+    /** Start announcement. */
+    void started(BackupCoordinator.Trigger trigger, Instant at, String interval) {
+        post(embed(COLOR_STARTED, "Backup started",
+                "Whole-server archive in progress — autosaves pause meanwhile.", at,
+                "TinyVault · automatic server protection",
+                (interval == null)
+                        ? new String[][]{{"Trigger", trigger.label}}
+                        : new String[][]{{"Trigger", trigger.label}, {"Every", interval}}));
     }
 
     /** Success announcement with the numbers a person actually cares about. */
-    void success(Instant recordedAt, long archiveBytes, Duration took, String nextNote) {
-        post(embed(COLOR_SUCCESS, "Backup completed", nextNote, recordedAt,
-                new String[][]{{"size", sizeText(archiveBytes)}, {"took", durationText(took)}}));
+    void success(Instant recordedAt, long archiveBytes, Duration took, String nextText) {
+        post(embed(COLOR_SUCCESS, "Backup completed",
+                "Uploaded, verified by content and in place.", recordedAt,
+                "TinyVault · automatic server protection",
+                new String[][]{{"Archive", sizeText(archiveBytes)}, {"Took", durationText(took)},
+                        {"Next", nextText}}));
     }
 
     /** Failure announcement; the friendly line first, the raw error as detail. */
     void failed(Instant at, String friendlyReason, String rawReason) {
-        String detail = rawReason == null || rawReason.isBlank() ? "unknown" : rawReason;
-        if (detail.length() > 500) {
-            detail = detail.substring(0, 500) + "…";
-        }
-        post(embed(COLOR_FAILED, "Backup failed", friendlyReason, at,
-                new String[][]{{"detail", detail}}));
+        post(embed(COLOR_FAILED, "Backup failed",
+                friendlyReason, at,
+                "Existing backups were not overwritten",
+                new String[][]{{"Detail", rawReason == null || rawReason.isBlank() ? "unknown" : rawReason}}));
     }
 
     /* ---- payload building ---- */
 
     private String embed(int color, String title, String description, Instant timestamp,
-                         String[][] fields) {
+                         String footer, String[][] fields) {
         // Discord rejects sub-millisecond-precision ISO timestamps with 400.
         String cleanTimestamp = timestamp.truncatedTo(java.time.temporal.ChronoUnit.MILLIS).toString();
         StringBuilder out = new StringBuilder();
@@ -105,7 +104,7 @@ final class DiscordWebhook {
                 .append(jsonEscape(fieldText(title, 256))).append('"');
         if (description != null && !description.isBlank()) {
             out.append(",\"description\":\"")
-                    .append(jsonEscape("*" + fieldText(description, 2048) + "*")).append('"');
+                    .append(jsonEscape(fieldText(description, 2048))).append('"');
         }
         out.append(",\"color\":").append(color);
         out.append(",\"timestamp\":\"").append(cleanTimestamp).append('"');
@@ -121,6 +120,10 @@ final class DiscordWebhook {
         // closes: fields array, embed object, embeds array, root object —
         // the field's own } came from the loop above
         out.append(']');
+        if (footer != null && !footer.isBlank()) {
+            out.append(",\"footer\":{\"text\":\"").append(jsonEscape(fieldText(footer, 2044)))
+                    .append("\"}");
+        }
         out.append('}');
         out.append(']');
         out.append('}');

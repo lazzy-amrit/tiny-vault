@@ -62,10 +62,11 @@ timezone: "Asia/Kolkata"
 # 12-hour format with AM/PM. Defaults to 24 when missing or invalid.
 time-format: "24"
 
-# FileLu account API key (My Account -> API Key -> switch ON). Only used in
-# s5 mode: it lets TinyVault purge deleted backups from FileLu's trash after
-# rotation, so trash contents don't trigger "storage full". Leave empty to
-# skip trash purging.
+# FileLu account API key (My Account -> API Key -> switch ON). REQUIRED in
+# s5 mode: without it deleted backups are NOT removed from FileLu's trash and
+# keep consuming your storage quota — the plugin will warn on every run. With
+# the key, TinyVault purges deleted backups from trash immediately after
+# rotation, freeing the space for the next upload.
 api-key: ""
 
 # S5 credentials from My Account on filelu.com.

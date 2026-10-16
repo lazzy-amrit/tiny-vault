@@ -128,7 +128,6 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
         new BukkitRunnable() {
             @Override
             public void run() {
-                Map<String, Long> sizes = coordinator.store().backupSizes();
                 long recentFailedCount = snapshot.failures().stream()
                         .filter(entry -> parseTime(entry).isAfter(Instant.now().minus(Duration.ofHours(48))))
                         .count();
@@ -136,8 +135,18 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
 
                 sender.sendMessage(header("backup status"));
                 sender.sendMessage(field("timezone:", zone.toString()));
-                sender.sendMessage(field("current.zip:", sizeText(sizes.get(S3BackupStore.PREFIX + "current.zip")) + "  (latest)"));
-                sender.sendMessage(field("old.zip:", sizeText(sizes.get(S3BackupStore.PREFIX + "old.zip")) + "  (previous)"));
+                Map<String, Long> slots = coordinator.store().slots();
+                boolean first = true;
+                for (Map.Entry<String, Long> slot : slots.entrySet()) {
+                    String label = first ? "latest:" : "one behind:" ;
+                    first = false;
+                    String name = slot.getKey().startsWith(S3BackupStore.PREFIX)
+                            ? slot.getKey().substring(S3BackupStore.PREFIX.length()) : slot.getKey();
+                    sender.sendMessage(field(label + "  ", name + "  " + sizeText(slot.getValue())));
+                }
+                if (slots.isEmpty()) {
+                    sender.sendMessage(field("slots:", "none found"));
+                }
                 sender.sendMessage(field("extreme:", coordinator.isExtreme()
                         ? "ON — backup before shutdown (min session " + coordinator.minSessionMinutes() + " min)"
                         : "off"));
@@ -201,7 +210,7 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
                     sender.sendMessage("----[ TinyVault · backup complete ]----");
                     sender.sendMessage("  done:          uploaded, verified and recorded");
                     sender.sendMessage("  recorded at:   " + fullTime.format(snapshot.lastSuccess()));
-                    sender.sendMessage("  moved along:   the previous backup now sits in old.zip");
+                    sender.sendMessage("  kept:          an older copy always sits one slot behind");
                     sender.sendMessage("  nothing was lost — your worlds and player data are on storage.");
                 } else {
                     String raw = snapshot.failures().isEmpty() ? "" : snapshot.failures().get(0);

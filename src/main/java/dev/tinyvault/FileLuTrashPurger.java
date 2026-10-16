@@ -69,7 +69,11 @@ final class FileLuTrashPurger {
 
     private boolean backupNameOf(String name) {
         String bare = name.substring(name.lastIndexOf('/') + 1);
-        return BACKUP_NAMES.contains(bare);
+        if (BACKUP_NAMES.contains(bare)) {
+            return true;
+        }
+        // the timestamped slot keys of the current version
+        return bare.matches("tv-\\d+\\.zip");
     }
 
     private void purge(String fileCode, String name) {

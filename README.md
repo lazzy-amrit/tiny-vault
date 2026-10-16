@@ -2,19 +2,17 @@
 
 # ⚠️ NOT MADE FOR NORMAL USE ⚠️
 
-## 🚨 YOU MUST CONFIGURE EVERYTHING YOURSELF 🚨
+**It is not made to be used normally — it was built for personal work.**
 
-**THIS PLUGIN DOES NOTHING OUT OF THE BOX.** Before the first start you must
-open `plugins/TinyVault/config.yml` and fill in your real storage endpoint,
-bucket, access key and secret key — **wrong or missing settings mean NO
-backups and zero warnings on your worlds shrinking into the void**. If you are
-not ready to read this README to the end, do not install this plugin.
+**Kindly read the code once and compile it according to your own work.**
+**The base is done for you in a good way.**
 
 Minimal Paper plugin that backs up the entire server directory to FileLu S5
 (S3-compatible) object storage and keeps exactly two remote ZIP archives:
 
-- `backups/current.zip` — latest successful backup
-- `backups/old.zip` — previous successful backup
+- `backups/tv-<timestamp>.zip` — exactly the two newest are kept. The
+  newest slot *is* the "current.zip" of this design (latest successful
+  backup); the slot behind it is the "old.zip" (previous successful backup).
 
 Backups run on a `timer` interval you set yourself — `24h` (default), `4h`,
 or minutes like `15m` (`m` = minutes, `h` = hours; a plain unsuffixed number
@@ -111,16 +109,23 @@ Notes:
   is paused while the archive is written and restored afterwards), then the
   whole server directory — excluding TinyVault's own folder, which holds the
   state file, config and temp archives — is streamed into one ZIP.
-- Two-slot rotation per run:
-  1. `backups/last.zip` (the oldest) is deleted first to make room.
-  2. If `backups/current.zip` exists, it is downloaded to a local temp file.
-  3. The new ZIP is uploaded straight to `backups/current.zip` and verified
-     (multipart PUTs are atomic: a failed upload leaves the old object intact).
-  4. The downloaded copy is uploaded to `backups/last.zip` and verified.
-  There is no remote temp object — nothing like `uploading.zip` is created, so
-  nothing lingers in your FileLu bucket or trash between runs (old leftovers
-  from previous plugin versions are cleaned up automatically at the next run).
-  A failed run leaves any surviving backup untouched.
+- Two slots are kept, but on FileLu they are **not named `current.zip` /
+  `old.zip`** — and that is deliberate. Verified live against FileLu's real
+  S5 gateway: overwriting an existing key breaks the object (HEAD and the
+  folder listing keep showing it, but the next GET returns 404), and so does
+  re-creating a key after a delete. Create-once uploads are the only form
+  that stayed reliable, so every backup lands on its own key
+  (`backups/tv-<millis>.zip`) and the two newest are kept:
+  1. The new archive uploads under a fresh key and is verified by content
+     (ranged tail read; multipart PUTs that fail abort and abort cleanly).
+  2. Only when two verified slots exist, older overflow and any leftover
+     legacy `current.zip`/`old.zip` from older plugin versions are deleted,
+     and their FileLu trash entries are purged (needs `api-key`).
+  So the bucket always holds exactly two healthy, downloadable zips: the
+  newest (your "current") and the one behind it (your "old").
+  There is no remote temp object, nothing lingers in the bucket or trash.
+  Standard S3 (CopyObject-capable providers) still uses the classic fixed
+  `current.zip`/`old.zip` names.
 - Archives larger than 64 MiB are uploaded as S3 multipart (64 MiB parts, up
   to three in parallel) because FileLu's gateway rejects long single-request
   PUTs. Interrupted uploads are aborted immediately, and any leftover
