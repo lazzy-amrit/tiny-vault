@@ -1,12 +1,25 @@
 # TinyVault
 
+# ⚠️ NOT MADE FOR NORMAL USE ⚠️
+
+## 🚨 YOU MUST CONFIGURE EVERYTHING YOURSELF 🚨
+
+**THIS PLUGIN DOES NOTHING OUT OF THE BOX.** Before the first start you must
+open `plugins/TinyVault/config.yml` and fill in your real storage endpoint,
+bucket, access key and secret key — **wrong or missing settings mean NO
+backups and zero warnings on your worlds shrinking into the void**. If you are
+not ready to read this README to the end, do not install this plugin.
+
 Minimal Paper plugin that backs up the entire server directory to FileLu S5
 (S3-compatible) object storage and keeps exactly two remote ZIP archives:
 
 - `backups/current.zip` — latest successful backup
-- `backups/last.zip` — previous successful backup
+- `backups/old.zip` — previous successful backup
 
-Backups run every `timer` hours (by default 24).
+Backups run on a `timer` interval you set yourself — `24h` (default), `4h`,
+or minutes like `15m` (`m` = minutes, `h` = hours; a plain unsuffixed number
+stays hours for older configs) — or, with `extreme: true`, automatically
+right before the server stops.
 
 ## Requirements
 
@@ -37,11 +50,47 @@ A Java 25 toolchain is provisioned automatically by Gradle. Output:
      `https://s5lu.com`)
    - `region` — FileLu's documented default is `global`; endpoint-specific
      values are `us-east`, `eu-central`, `ap-southeast`, `me-central`
-   - `timer` — backup interval, read as hours (default 24)
+   - `timer` — backup interval with unit suffix: `"15m"` = every 15
+     **m**inutes, `"4h"` = every 4 **h**ours (plain `24` = 24 hours, for
+     older configs). Nothing goes beyond hours: there is no `d` for days —
+     days are expressed in hours.
+   - `webhook-url` — optional Discord webhook URL (see the Webhooks section
+     below). Empty = no Discord announcements.
+   - `extreme` — `true` forgets the timer entirely: a backup runs
+     automatically right before the server stops, and a manual backup in
+     flight is always waited for. Sessions shorter than
+     `extreme-min-session-minutes` (default 30) are skipped, so quick
+     start/stop testing rounds never trigger backups; a one-time startup
+     backup still happens if the bucket never received a successful backup.
    - `timezone` — IANA zone for command output (default `Asia/Kolkata`),
      e.g. `Asia/Dhaka`, `Europe/Berlin`, `UTC`
    Keep this file private — it contains credentials.
 3. Restart the server.
+
+## Discord webhooks
+
+TinyVault can announce every backup on a Discord channel. In Discord:
+**Server Settings → Integrations → Webhooks → New Webhook → (pick a channel) →
+Copy Webhook URL**, and paste that URL into `webhook-url` in the plugin's
+`config.yml`. Announcements fire at three moments, as colored embeds:
+
+- **Backup started** (blue) — the trigger (timer schedule, `/vault back`,
+  server shutdown…), plus a note that the whole server is being saved and
+  autosaves are paused meanwhile.
+- **Backup completed** (green) — archive size, how long it took, and when
+  the next one is due.
+- **Backup failed** (red) — a plain-language explanation of what happened,
+  plus the raw technical error for digging.
+
+Notes:
+
+- Announcements are optional — leave `webhook-url` empty and nothing is sent.
+- Posting happens on its own background thread: Discord being slow or down
+  never delays a backup and never blocks server shutdown.
+- A failed announcement only appears as a one-line warning in the server log;
+  it never counts as a backup failure.
+- The webhook never leaks your storage credentials — messages only contain
+  sizes, durations, triggers and failure reasons.
 
 ## Behavior
 
@@ -49,6 +98,15 @@ A Java 25 toolchain is provisioned automatically by Gradle. Output:
   deadline of the last successful backup is already overdue, a backup starts
   immediately; otherwise it runs when the deadline passes (checked every five
   minutes, so it never backs up early and catches up right after the deadline).
+  With `extreme: true` the schedule is skipped completely and backups happen
+  at server shutdown instead (see the config section above).
+- New uploads are verified by content, not just by HEAD metadata: FileLu's
+  gateway can keep serving the metadata of the *previous* object for minutes
+  after an overwrite, which used to cause false "expected N bytes" failures.
+  Verification now recognizes that stale state, waits with growing backoff
+  (over twenty minutes total), and reads the tail of the stored object
+  directly with a ranged GET — actual object bytes prove the upload landed,
+  so the wait usually ends after one check instead of failing the run.
 - Each run: all worlds and player data are saved on the main thread (autosave
   is paused while the archive is written and restored afterwards), then the
   whole server directory — excluding TinyVault's own folder, which holds the

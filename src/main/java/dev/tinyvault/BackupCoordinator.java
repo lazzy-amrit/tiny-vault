@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
@@ -18,27 +19,49 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * Runs one whole-server backup per 24-hour deadline. A cheap periodic check
- * (every five minutes) compares the clock against the deadline: while the
- * deadline is ahead it waits, once it is overdue the backup starts
- * immediately. Only one backup ever runs at a time.
+ * Runs whole-server backups. Default mode: one backup per 24-hour deadline,
+ * triggered by a cheap periodic check (every five minutes; the backup starts
+ * as soon as the deadline is overdue). Extreme mode (`extreme: true`): the
+ * timer is skipped entirely and a backup runs automatically right before the
+ * server stops — gated to server sessions of at least the configured minimum
+ * (default 30 minutes) so quick start/stop testing rounds do not trigger
+ * backups. Only one backup ever runs at a time.
  */
 final class BackupCoordinator {
     private static final long CHECK_PERIOD_TICKS = 20L * 60 * 5;
     private static final int DEFAULT_TIMER_HOURS = 24;
+    private static final int DEFAULT_MIN_SESSION_MINUTES = 30;
+    /** A success this fresh means a shutdown backup would only duplicate it. */
+    private static final Duration RECENT_SUCCESS_WINDOW = Duration.ofMinutes(10);
 
     /** Progress phases surfaced to the /vault back command. */
     enum Phase { IDLE, SAVING, ARCHIVING, UPLOADING }
+
+    /** What started the current backup, for logs and webhook messages. */
+    enum Trigger {
+        STARTUP("startup"), SCHEDULED("timer schedule"), MANUAL("/vault back command"),
+        SHUTDOWN("server shutdown");
+
+        final String label;
+
+        Trigger(String label) {
+            this.label = label;
+        }
+    }
 
     private final Plugin plugin;
     private final S3BackupStore store;
     private final ServerArchiver archiver;
     private final BackupState state;
+    private final DiscordWebhook webhook;
     private final Duration backupInterval;
     private final boolean fileLuMode;
+    private final boolean extreme;
+    private final Duration minSession;
     private final Path tempDir;
     private final AtomicBoolean running = new AtomicBoolean();
     private volatile Phase phase = Phase.IDLE;
+    private Instant sessionStart = Instant.now();
     private final ExecutorService worker = Executors.newSingleThreadExecutor(runnable -> {
         Thread thread = new Thread(runnable, "TinyVault-backup");
         thread.setDaemon(true);
@@ -47,13 +70,17 @@ final class BackupCoordinator {
     private BukkitTask checkTask;
 
     private BackupCoordinator(Plugin plugin, S3BackupStore store, ServerArchiver archiver, BackupState state,
-                              Duration backupInterval, boolean fileLuMode) {
+                              Duration backupInterval, boolean fileLuMode, boolean extreme, Duration minSession,
+                              DiscordWebhook webhook) {
         this.plugin = plugin;
         this.store = store;
         this.archiver = archiver;
         this.state = state;
         this.backupInterval = backupInterval;
         this.fileLuMode = fileLuMode;
+        this.extreme = extreme;
+        this.minSession = minSession;
+        this.webhook = webhook;
         this.tempDir = plugin.getDataFolder().toPath().resolve("tmp");
     }
 
@@ -74,15 +101,53 @@ final class BackupCoordinator {
         FileLuTrashPurger trashPurger = fileLuMode
                 ? new FileLuTrashPurger(apiKey, message -> plugin.getLogger().warning(message))
                 : new FileLuTrashPurger("", null);
-        int timerHours = config.getInt("timer", DEFAULT_TIMER_HOURS);
-        Duration backupInterval = Duration.ofHours(timerHours < 1 ? DEFAULT_TIMER_HOURS : timerHours);
+        String timerRaw = config.getString("timer", "24");
+        Duration backupInterval = parseInterval(timerRaw);
+        boolean extreme = config.getBoolean("extreme", false);
+        long minSessionMinutes = config.getLong("extreme-min-session-minutes", DEFAULT_MIN_SESSION_MINUTES);
+        Duration minSession = Duration.ofMinutes(Math.max(1, minSessionMinutes));
+        DiscordWebhook webhook = new DiscordWebhook(config.getString("webhook-url", ""),
+                plugin.getLogger()::warning);
 
         BackupState state = new BackupState(plugin.getDataFolder().toPath().resolve("state.txt"));
         state.load();
         S3BackupStore store = new S3BackupStore(endpoint, region, pathStyle, bucket, accessKey, secretKey,
                 fileLuMode, trashPurger);
         ServerArchiver archiver = new ServerArchiver(serverRoot(plugin), plugin.getDataFolder().toPath());
-        return new BackupCoordinator(plugin, store, archiver, state, backupInterval, fileLuMode);
+        return new BackupCoordinator(plugin, store, archiver, state, backupInterval, fileLuMode, extreme,
+                minSession, webhook);
+    }
+
+    /**
+     * Timer values are `h` for hours and `m` for minutes ("15m", "4h",
+     * "24h"); a plain number without suffix stays hours (backwards
+     * compatible with earlier configs). Anything invalid falls back to 24h,
+     * and the smallest allowed interval is one minute.
+     */
+    static Duration parseInterval(String raw) {
+        if (raw == null) {
+            return Duration.ofHours(DEFAULT_TIMER_HOURS);
+        }
+        String value = raw.strip().toLowerCase(Locale.ROOT);
+        try {
+            if (value.endsWith("m")) {
+                return Duration.ofMinutes(Math.max(1, Long.parseLong(value.substring(0, value.length() - 1).strip())));
+            }
+            if (value.endsWith("h")) {
+                value = value.substring(0, value.length() - 1);
+            }
+            return Duration.ofHours(Math.max(1, Long.parseLong(value)));
+        } catch (NumberFormatException e) {
+            return Duration.ofHours(DEFAULT_TIMER_HOURS);
+        }
+    }
+
+    /** Human interval text for logs and webhook notes: "24h" or "15m" style. */
+    private String formatInterval(Duration interval) {
+        if (interval.getSeconds() % 3600 == 0) {
+            return (interval.getSeconds() / 3600) + "h";
+        }
+        return (interval.getSeconds() / 60) + "m";
     }
 
     /**
@@ -101,12 +166,24 @@ final class BackupCoordinator {
     }
 
     void start() {
+        sessionStart = Instant.now();
         Instant last = state.lastSuccess();
-        Instant due = nextDue(last);
         plugin.getLogger().info("Rotation mode: " + (fileLuMode ? "s5 (FileLu)" : "s3 (universal)"));
+        if (extreme) {
+            plugin.getLogger().info("Extreme mode ON: the " + formatInterval(backupInterval) + " timer is skipped — "
+                    + "backups run automatically before the server stops (sessions of at least "
+                    + minSession.toMinutes() + " minutes).");
+            if (last == null) {
+                plugin.getLogger().info("No previous backup exists at all; one starts now so nothing is lost.");
+                startBackup(Trigger.STARTUP);
+            }
+            return;
+        }
+        Instant due = nextDue(last);
         plugin.getLogger().info(last == null
                 ? "No previous backup found; a backup will start now"
-                : "Last successful backup " + last + "; next backup due " + due);
+                : "Last successful backup " + last + "; next backup due " + due
+                        + " (" + formatInterval(backupInterval) + " timer)");
         checkTask = Bukkit.getScheduler().runTaskTimerAsynchronously(plugin, this::check, 20L, CHECK_PERIOD_TICKS);
     }
 
@@ -126,17 +203,30 @@ final class BackupCoordinator {
         return backupInterval;
     }
 
+    boolean isExtreme() {
+        return extreme;
+    }
+
+    long minSessionMinutes() {
+        return minSession.toMinutes();
+    }
+
     /**
      * Runs one backup immediately, recording it like any scheduled one (the
      * next deadline is measured from this backup's success). Returns false if
      * a backup is already running.
      */
     boolean requestManualBackup() {
+        return startBackup(Trigger.MANUAL);
+    }
+
+    /** Shared launcher for every single-thread backup run. */
+    private boolean startBackup(Trigger trigger) {
         if (running.get() || !running.compareAndSet(false, true)) {
             return false;
         }
         try {
-            worker.execute(this::runBackup);
+            worker.execute(() -> runBackup(trigger));
             return true;
         } catch (RejectedExecutionException e) {
             running.set(false);
@@ -156,23 +246,22 @@ final class BackupCoordinator {
         if (running.get() || Instant.now().isBefore(nextDue(state.lastSuccess()))) {
             return;
         }
-        if (!running.compareAndSet(false, true)) {
-            return;
-        }
-        try {
-            worker.execute(this::runBackup);
-        } catch (RejectedExecutionException e) {
-            running.set(false);
-        }
+        startBackup(Trigger.SCHEDULED);
     }
 
     Phase phase() {
         return phase;
     }
 
-    private void runBackup() {
+    private void runBackup(Trigger trigger) {
         Instant startedAt = Instant.now();
         Path archive = tempDir.resolve("backup-" + startedAt.toEpochMilli() + ".zip.part");
+        webhook.started(trigger, startedAt, switch (trigger) {
+            case SCHEDULED -> "a whole-server backup is running (every " + formatInterval(backupInterval) + ")";
+            case MANUAL -> "a whole-server backup is running (started with /vault back)";
+            case SHUTDOWN -> "the server is stopping — final whole-server backup before it does";
+            case STARTUP -> "startup protection — no backup existed yet, creating one now";
+        });
         try {
             phase = Phase.SAVING;
             awaitOnMainThread(() -> {
@@ -198,14 +287,20 @@ final class BackupCoordinator {
             phase = Phase.UPLOADING;
             store.rotate(archive, Files.size(archive));
             state.recordSuccess(startedAt);
+            long archiveSize = Files.size(archive);
             plugin.getLogger().info(String.format(
                     "Backup completed in %ds (%.1f MiB) -> %scurrent.zip",
                     Duration.between(startedAt, Instant.now()).toSeconds(),
-                    Files.size(archive) / 1024.0 / 1024.0,
+                    archiveSize / 1024.0 / 1024.0,
                     S3BackupStore.PREFIX));
+            String nextNote = extreme
+                    ? "the next backup finishes at the next server shutdown"
+                    : ("next one due " + nextDue(startedAt) + " (" + formatInterval(backupInterval) + ")");
+            webhook.success(startedAt, archiveSize, Duration.between(startedAt, Instant.now()), nextNote);
         } catch (Exception e) {
             String reason = e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage();
             plugin.getLogger().warning("Backup failed: " + reason);
+            webhook.failed(Instant.now(), VaultCommand.friendlyReason(reason), reason);
             try {
                 state.recordFailure(Instant.now(), reason);
             } catch (IOException stateError) {
@@ -224,6 +319,12 @@ final class BackupCoordinator {
 
     /** Runs the given action on the main server thread and waits for it to finish. */
     private void awaitOnMainThread(Runnable action) throws Exception {
+        if (Bukkit.isPrimaryThread()) {
+            // Shutdown backups run inline in onDisable, on the main thread
+            // itself — the scheduler is already stopped at that point.
+            action.run();
+            return;
+        }
         CompletableFuture<Void> done = new CompletableFuture<>();
         Bukkit.getScheduler().runTask(plugin, () -> {
             try {
@@ -245,14 +346,61 @@ final class BackupCoordinator {
         if (checkTask != null) {
             checkTask.cancel();
         }
-        worker.shutdown();
         if (running.get()) {
-            plugin.getLogger().warning("Backup interrupted while stopping; existing remote backups were preserved");
+            // A backup is in flight; stopping now would interrupt it. Wait for
+            // it to finish so the freshly-made backup is actually uploaded.
+            plugin.getLogger().info("A backup is running — waiting for it to finish before the server stops...");
+            long deadline = System.currentTimeMillis() + 30L * 60 * 1000;
+            while (running.get() && System.currentTimeMillis() < deadline) {
+                try {
+                    Thread.sleep(500L);
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            if (running.get()) {
+                plugin.getLogger().warning("Backup still running when the wait ended; existing remote backups were preserved");
+            }
+        } else if (extreme && shutdownBackupDue()) {
+            runShutdownBackup();
         }
+        worker.shutdown();
+        webhook.close();
         for (World world : Bukkit.getWorlds()) {
             if (!world.isAutoSave()) {
                 world.setAutoSave(true);
             }
         }
+    }
+
+    /**
+     * The extreme-mode trigger: before the server stops, back the server up
+     * unless the session was too short (quick testing start/stop rounds) or a
+     * success this fresh already covers the session.
+     */
+    private boolean shutdownBackupDue() {
+        Duration session = Duration.between(sessionStart, Instant.now());
+        if (session.compareTo(minSession) < 0) {
+            plugin.getLogger().info("Extreme mode: session was under " + minSession.toMinutes()
+                    + " minutes, skipping the shutdown backup.");
+            return false;
+        }
+        Instant last = state.lastSuccess();
+        if (last != null && Duration.between(last, Instant.now()).compareTo(RECENT_SUCCESS_WINDOW) < 0) {
+            plugin.getLogger().info("Extreme mode: " + last + " already recorded a backup minutes ago, "
+                    + "skipping the shutdown backup.");
+            return false;
+        }
+        return true;
+    }
+
+    /** Runs the shutdown backup inline (onDisable is on the main thread) and blocks until it finishes. */
+    private void runShutdownBackup() {
+        if (!running.compareAndSet(false, true)) {
+            return;
+        }
+        plugin.getLogger().info("Extreme mode: backing the server up before it stops — do not close the process.");
+        runBackup(Trigger.SHUTDOWN);
     }
 }

@@ -138,12 +138,16 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
                 sender.sendMessage(field("timezone:", zone.toString()));
                 sender.sendMessage(field("current.zip:", sizeText(sizes.get(S3BackupStore.PREFIX + "current.zip")) + "  (latest)"));
                 sender.sendMessage(field("old.zip:", sizeText(sizes.get(S3BackupStore.PREFIX + "old.zip")) + "  (previous)"));
+                sender.sendMessage(field("extreme:", coordinator.isExtreme()
+                        ? "ON — backup before shutdown (min session " + coordinator.minSessionMinutes() + " min)"
+                        : "off"));
                 sender.sendMessage(field("last success:", snapshot.lastSuccess() == null
                         ? "never" : fullTime.format(snapshot.lastSuccess())));
                 sender.sendMessage(field("status:", snapshot.currentStatus()
                         + (coordinator.backupRunning() ? " · a backup is running right now" : "")));
-                sender.sendMessage(field("next due:", nextDue.equals(Instant.EPOCH)
-                        ? "now (overdue)" : fullTime.format(nextDue)));
+                sender.sendMessage(field("next due:", coordinator.isExtreme()
+                        ? "excused — extreme mode backs up at shutdown"
+                        : (nextDue.equals(Instant.EPOCH) ? "now (overdue)" : fullTime.format(nextDue))));
                 sender.sendMessage(field("failures 48h:", recentFailedCount + "  (recorded total: "
                         + snapshot.failures().size() + ")"));
             }
@@ -156,7 +160,8 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             return;
         }
         Instant previousLastSuccess = coordinator.state().lastSuccess();
-        sender.sendMessage("[TinyVault] Backup started — progress updates follow.");
+        sender.sendMessage("----[ TinyVault · backup starting ]----");
+        sender.sendMessage("  progress updates arrive every couple of minutes — hang tight.");
         new BukkitRunnable() {
             private BackupCoordinator.Phase lastAnnounced = BackupCoordinator.Phase.IDLE;
             private boolean sawRunning = false;
@@ -193,20 +198,55 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             private void finishReport(Instant baseline) {
                 BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
                 if (snapshot.lastSuccess() != null && !snapshot.lastSuccess().equals(baseline)) {
-                    sender.sendMessage("[TinyVault] Backup completed and recorded at "
-                            + fullTime.format(snapshot.lastSuccess()) + ".");
+                    sender.sendMessage("----[ TinyVault · backup complete ]----");
+                    sender.sendMessage("  done:          uploaded, verified and recorded");
+                    sender.sendMessage("  recorded at:   " + fullTime.format(snapshot.lastSuccess()));
+                    sender.sendMessage("  moved along:   the previous backup now sits in old.zip");
+                    sender.sendMessage("  nothing was lost — your worlds and player data are on storage.");
                 } else {
-                    String reason = !snapshot.failures().isEmpty()
-                            ? snapshot.failures().get(0)
-                            : "unknown reason";
-                    if (reason.contains(" | ")) {
-                        reason = reason.substring(reason.indexOf(" | ") + 3);
-                    }
-                    sender.sendMessage("[TinyVault] Backup FAILED — reason: " + reason);
-                    sender.sendMessage("           Your existing backups were preserved; the next scheduled run will retry.");
+                    String raw = snapshot.failures().isEmpty() ? "" : snapshot.failures().get(0);
+                    String reason = raw.contains(" | ") ? raw.substring(raw.indexOf(" | ") + 3) : raw;
+                    sender.sendMessage("----[ TinyVault · backup failed ]----");
+                    sender.sendMessage("  what happened:  " + friendlyReason(reason));
+                    sender.sendMessage("  technical:      " + (reason.isEmpty() ? "unknown" : reason));
+                    sender.sendMessage("  untouched:      your existing backups were NOT overwritten");
+                    sender.sendMessage("  next:           the next run retries automatically; "
+                            + "watch progress with /vault detail");
                 }
             }
         }.runTaskTimerAsynchronously(plugin, 0L, 40L);
+    }
+
+    /**
+     * Turns S3/gateway error strings into something a person can actually act on.
+     * Package-visible so the Discord webhook gets the same friendly wording.
+     */
+    static String friendlyReason(String reason) {
+        if (reason.isBlank()) {
+            return "no reason was recorded — check the server log";
+        }
+        String lower = reason.toLowerCase(Locale.ROOT);
+        if (lower.contains("expected ") && lower.contains("bytes") || lower.contains("propagat")) {
+            return "the storage service is still catching up with the fresh upload";
+        }
+        if (lower.contains("checksum")) {
+            return "the uploaded archive was not readable as a whole just yet";
+        }
+        if (lower.contains("quota") || lower.contains("storage") && lower.contains("full")
+                || lower.contains("403") && lower.contains("exceed")) {
+            return "storage is full — free up space in the bucket or FileLu trash";
+        }
+        if (lower.contains("connection") || lower.contains("timed out") || lower.contains("timeout")
+                || lower.contains("unknownhost") || lower.contains("dns")) {
+            return "the server could not reach the storage service (network hiccup)";
+        }
+        if (lower.contains("aborted") || lower.contains("interrupt")) {
+            return "the upload was interrupted midway (server busy or connection dropped)";
+        }
+        if (lower.contains("denied") || lower.contains("credentials")) {
+            return "storage refused the request — check access-key and secret-key in config.yml";
+        }
+        return "storage did not accept the backup";
     }
 
     /* ---- list ---- */
@@ -259,7 +299,7 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             recent++;
             String reason = failure.contains(" | ") ? failure.substring(failure.indexOf(" | ") + 3) : failure;
             sender.sendMessage(" " + index + ".  " + fullTime.format(at));
-            sender.sendMessage("      reason: " + reason);
+            sender.sendMessage("      what happened: " + friendlyReason(reason));
             index++;
         }
         if (index == 1) {

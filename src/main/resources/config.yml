@@ -26,8 +26,32 @@ region: "global"
 # FileLu S5 uses path-style addressing.
 path-style: true
 
-# Hours between backups (number, read as hours; default 24). Example: 4 = every 4 hours.
-timer: 24
+# Hours or minutes between backups. Suffix decides the unit: `m` = minutes,
+# `h` = hours ("15m" = every 15 minutes, "4h" = every 4 hours). A plain
+# number without suffix is read as hours (older configs keep working):
+# `timer: 24` means every 24 hours. Example for fast testing: timer: "15m".
+timer: "15m"
+
+# OPTIONAL Discord announcements. Paste your channel's webhook URL here
+# (Discord -> Server Settings -> Integrations -> Webhooks -> New Webhook ->
+# Copy Webhook URL). Each backup start, success and failure is then posted
+# as a colored embed: blue = started, green = done, red = failed. Announcements
+# never delay or block a backup, and an unreachable Discord only logs a
+# warning. Leave empty to disable.
+webhook-url: ""
+
+# EXTREME MODE: true forgets the `timer` limit entirely. No schedule runs;
+# instead a backup starts automatically right before the server stops
+# (and a running manual backup is always waited for). Sessions shorter than
+# `extreme-min-session-minutes` are skipped, so quick start/stop testing
+# rounds never trigger backups. A one-time startup backup still happens if
+# the bucket has never received a successful backup at all. Default: false.
+extreme: false
+
+# Minimum server session length, in minutes, for extreme mode's shutdown
+# backup (default 30). Set it equal to how long you actually play before
+# restarting.
+extreme-min-session-minutes: 30
 
 # IANA timezone used by /vault commands to display dates and times.
 # Examples: Asia/Kolkata (India), Asia/Dhaka, Europe/Berlin, America/New_York, UTC.

@@ -75,6 +75,18 @@ final class S3BackupStore implements AutoCloseable {
     private static final String OLD_KEY = PREFIX + "old.zip";
     private static final long PART_SIZE = 64L * 1024 * 1024;
     private static final int MAX_PARALLEL_PARTS = 3;
+    /** Bytes of the stored object read back directly to bypass stale HEAD metadata. */
+    private static final int TAIL_CHECK_BYTES = 4096;
+    /**
+     * Backoff between verification attempts. FileLu's gateway can serve the
+     * metadata of a previous object for several minutes after an overwrite;
+     * this gives the gateway over twenty minutes before a run is reported as
+     * failed, and every attempt also reads the object itself as an escape hatch
+     * (see tailMatchesRemote).
+     */
+    private static final long[] VERIFY_WAITS_MILLIS = {
+            20_000L, 30_000L, 45_000L, 60_000L, 90_000L, 90_000L,
+            120_000L, 120_000L, 180_000L, 180_000L, 240_000L, 240_000L};
 
     private final S3Client s3;
     private final String bucket;
@@ -108,6 +120,19 @@ final class S3BackupStore implements AutoCloseable {
             trashPurger.purgeBackupNames(); // immediately free the space old.zip just moved to trash
         }
 
+        // Size of current.zip before this run. A HEAD that reports exactly this
+        // size after the upload is provably stale metadata (the new upload
+        // almost never happens to have the exact previous size), which lets the
+        // verification log the situation accurately instead of guessing.
+        long previousCurrentSize = -1;
+        try {
+            if (objectExists(CURRENT_KEY)) {
+                previousCurrentSize = head(CURRENT_KEY).contentLength();
+            }
+        } catch (Exception ignored) {
+            // best effort; verification works without it
+        }
+
         Path previous = archive.resolveSibling("previous.zip");
         try {
             if (objectExists(CURRENT_KEY)) {
@@ -123,11 +148,11 @@ final class S3BackupStore implements AutoCloseable {
                 }
             }
             upload(CURRENT_KEY, archive);
-            verifyUpload(CURRENT_KEY, archive, size);
+            verifyUpload(CURRENT_KEY, archive, size, previousCurrentSize);
             if (Files.exists(previous)) {
                 long previousSize = Files.size(previous);
                 upload(OLD_KEY, previous);
-                verifyUpload(OLD_KEY, previous, previousSize);
+                verifyUpload(OLD_KEY, previous, previousSize, -1);
             }
         } finally {
             try {
@@ -257,36 +282,76 @@ final class S3BackupStore implements AutoCloseable {
 
     /* ---- verification and small operations ---- */
 
-    private void verifyUpload(String key, Path file, long size) throws IOException {
+    private void verifyUpload(String key, Path file, long size, long previousSize) throws IOException {
         // FileLu's gateway is eventually consistent: right after an upload (or
         // a delete) HEAD can report the previous object for minutes. Re-check
-        // patiently before failing; the next scheduled run retries anyway.
+        // patiently before failing, and read the tail of the stored object
+        // directly on every miss — actual object bytes are not subject to the
+        // stale-metadata cache the way HEAD is, so a matching tail proves the
+        // upload landed and ends the wait early. The next scheduled run
+        // retries anyway if everything really is broken.
         IOException failure = null;
-        for (int attempt = 1; attempt <= 10; attempt++) {
+        int attempts = VERIFY_WAITS_MILLIS.length;
+        for (int attempt = 0; attempt < attempts; attempt++) {
             try {
                 HeadObjectResponse head = head(key);
-                if (head.contentLength() == size) {
+                long remote = head.contentLength();
+                if (remote == size) {
                     String etag = head.eTag();
                     if (etag == null || etag.contains("-")
                             || md5Hex(file).equalsIgnoreCase(stripQuotes(etag))) {
                         return;
                     }
                     failure = new IOException(key + ": checksum mismatch after upload");
+                } else if (previousSize >= 0 && remote == previousSize) {
+                    failure = new IOException(key + ": storage still reports the previous object (" + remote
+                            + " bytes; new backup is " + size + "), waiting for its metadata to refresh");
                 } else {
                     failure = new IOException(key + ": expected " + size + " bytes but remote object has "
-                            + head.contentLength() + " (remote state may still be propagating)");
+                            + remote + " (remote state may still be propagating)");
                 }
             } catch (NoSuchKeyException e) {
                 failure = new IOException(key + ": temporarily not readable after upload (propagation)", e);
             }
+            if (tailMatchesRemote(key, file, size)) {
+                return;
+            }
             try {
-                Thread.sleep(20_000L);
+                Thread.sleep(VERIFY_WAITS_MILLIS[attempt]);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw failure;
             }
         }
         throw failure;
+    }
+
+    /**
+     * Reads the last few bytes of the stored object with a ranged GET and
+     * compares them against the local file. A matching tail proves the upload
+     * is complete and intact even while HEAD is still serving stale metadata
+     * (which is exactly what the "expected ... bytes" failures were).
+     */
+    private boolean tailMatchesRemote(String key, Path file, long size) {
+        long tail = Math.min(TAIL_CHECK_BYTES, size);
+        long start = size - tail;
+        byte[] local;
+        try (InputStream in = Files.newInputStream(file)) {
+            in.skipNBytes(start);
+            local = in.readNBytes((int) tail);
+        } catch (IOException e) {
+            return false;
+        }
+        try (var object = s3.getObject(GetObjectRequest.builder()
+                .bucket(bucket)
+                .key(key)
+                .range("bytes=" + start + "-" + (size - 1))
+                .build())) {
+            byte[] remote = object.readAllBytes();
+            return remote.length == local.length && MessageDigest.isEqual(local, remote);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     private void download(String key, Path destination) throws IOException {
