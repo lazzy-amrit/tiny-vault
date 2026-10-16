@@ -85,7 +85,7 @@ final class BackupState {
     record StateSnapshot(List<Instant> successes, List<String> failures, Instant lastSuccess, String currentStatus) {
     }
 
-    /** Called only after the upload to S3 completed and was verified. */
+    /** Called only after the Swift upload completed successfully. */
     synchronized void recordSuccess(Instant when) throws IOException {
         successes.addFirst(when);
         while (successes.size() > MAX_TIMESTAMPS) {

@@ -23,9 +23,7 @@ final class DiscordWebhook {
     private final String url; // null = disabled
     private final Consumer<String> warning;
 
-    private final HttpClient client = HttpClient.newBuilder()
-            .connectTimeout(Duration.ofSeconds(10))
-            .build();
+    private final HttpClient client;
 
     private final java.util.concurrent.ExecutorService sender =
             java.util.concurrent.Executors.newSingleThreadExecutor(runnable -> {
@@ -35,7 +33,14 @@ final class DiscordWebhook {
             });
 
     DiscordWebhook(String rawUrl, Consumer<String> warning) {
+        this(rawUrl, warning, HttpClient.newBuilder()
+                .connectTimeout(Duration.ofSeconds(10))
+                .build());
+    }
+
+    DiscordWebhook(String rawUrl, Consumer<String> warning, HttpClient client) {
         this.warning = warning;
+        this.client = client;
         String cleaned = sanitizeWebhookUrl(rawUrl);
         if (!cleaned.isBlank() && !cleaned.startsWith("https://discord.com/api/webhooks/")
                 && !cleaned.startsWith("https://discordapp.com/api/webhooks/")) {
@@ -79,7 +84,7 @@ final class DiscordWebhook {
     /** Success announcement with the numbers a person actually cares about. */
     void success(Instant recordedAt, long archiveBytes, Duration took, String nextText) {
         post(embed(COLOR_SUCCESS, "Backup completed",
-                "Uploaded, verified by content and in place.", recordedAt,
+                "Uploaded successfully and in place.", recordedAt,
                 "TinyVault · automatic server protection",
                 new String[][]{{"Archive", sizeText(archiveBytes)}, {"Took", durationText(took)},
                         {"Next", nextText}}));

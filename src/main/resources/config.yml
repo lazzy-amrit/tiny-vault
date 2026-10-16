@@ -1,74 +1,42 @@
-# TinyVault configuration.
-# Keep this file private: it contains storage credentials.
-# NOTE: `timer` only affects the periodic backup scheduling. The value is a
-# plain number and is read as HOURS; it defaults to 24 when missing or invalid.
+# TinyVault 1.0.4 configuration. Keep this file private: it contains credentials.
 
-# mode: "s3" is the universal default for standard S3-compatible providers
-# (uses server-side CopyObject for the rotation). "s5" is for FileLu S5,
-# whose gateway has no working CopyObject and whose deleted objects land in
-# FileLu's trash — s5 mode downloads the previous backup locally instead and
-# purges trash entries so they don't consume quota.
-mode: "s3"
+# Your Blomp account email and password — the only credentials the plugin
+# needs. Auth happens over Blomp's Swift-compatible API (Keystone v3, with a
+# v2.0 fallback).
+username: ""
+password: ""
 
-# FileLu S5 endpoint. Regional hosts: https://ap.s5lu.com (Asia Pacific),
-# https://us.s5lu.com, https://eu.s5lu.com, https://me.s5lu.com, or the global
-# https://s5lu.com.
-endpoint: "https://ap.s5lu.com"
+# Where backups live on Blomp: first segment is the Swift container, so the
+# default keeps zips under container "tinyvault". Change the container name
+# if you prefer your own.
+dir: "tinyvault"
 
-# Bucket = the FileLu folder enabled as an S5 bucket
-# (file manager -> Edit Folder -> S5 Bucket -> Save).
-bucket: ""
+# How many TinyVault-managed ZIP backups to keep on Blomp. Every time a new
+# backup finishes uploading, the oldest ones beyond this number are removed
+# permanently (Swift has no trash — deletion is real). Unrelated files in the
+# container are never touched. Default 3.
+limit: 3
 
-# FileLu region. The documented default is "global"; other valid values are
-# "us-east", "eu-central", "ap-southeast", "me-central" (per endpoint).
-region: "global"
+# Interval supports minutes or hours: "15m", "4h", or a plain number of
+# hours ("24" means 24 hours). Minimum: one minute.
+timer: "24h"
 
-# FileLu S5 uses path-style addressing.
-path-style: true
-
-# Hours or minutes between backups. Suffix decides the unit: `m` = minutes,
-# `h` = hours ("15m" = every 15 minutes, "4h" = every 4 hours). A plain
-# number without suffix is read as hours (older configs keep working):
-# `timer: 24` means every 24 hours. Example for fast testing: timer: "15m".
-timer: "15m"
-
-# OPTIONAL Discord announcements. Paste your channel's webhook URL here
-# (Discord -> Server Settings -> Integrations -> Webhooks -> New Webhook ->
-# Copy Webhook URL). Each backup start, success and failure is then posted
-# as a colored embed: blue = started, green = done, red = failed. Announcements
-# never delay or block a backup, and an unreachable Discord only logs a
-# warning. Leave empty to disable.
-webhook-url: ""
-
-# EXTREME MODE: true forgets the `timer` limit entirely. No schedule runs;
-# instead a backup starts automatically right before the server stops
-# (and a running manual backup is always waited for). Sessions shorter than
-# `extreme-min-session-minutes` are skipped, so quick start/stop testing
-# rounds never trigger backups. A one-time startup backup still happens if
-# the bucket has never received a successful backup at all. Default: false.
-extreme: false
-
-# Minimum server session length, in minutes, for extreme mode's shutdown
-# backup (default 30). Set it equal to how long you actually play before
-# restarting.
-extreme-min-session-minutes: 30
-
-# IANA timezone used by /vault commands to display dates and times.
-# Examples: Asia/Kolkata (India), Asia/Dhaka, Europe/Berlin, America/New_York, UTC.
-# Defaults to Asia/Kolkata when missing or invalid.
+# IANA timezone used for backup filenames and /vault date/time output.
+# Examples: Asia/Kolkata (India), Asia/Dhaka, Europe/Berlin, UTC.
 timezone: "Asia/Kolkata"
 
-# Clock style for /vault command output: "24" for 24-hour format, "12" for
-# 12-hour format with AM/PM. Defaults to 24 when missing or invalid.
+# /vault time display AND backup filename style: "24" keeps names like
+# backup-2026-10-16_18.44-..., "12" puts AM/PM into the name instead.
+# There is no separate filename format option — these two decide everything.
 time-format: "24"
 
-# FileLu account API key (My Account -> API Key -> switch ON). REQUIRED in
-# s5 mode: without it deleted backups are NOT removed from FileLu's trash and
-# keep consuming your storage quota — the plugin will warn on every run. With
-# the key, TinyVault purges deleted backups from trash immediately after
-# rotation, freeing the space for the next upload.
-api-key: ""
+# Optional Discord webhook URL. Leave empty to disable announcements: every
+# backup start, success and failure is posted as a colored embed.
+webhook-url: ""
 
-# S5 credentials from My Account on filelu.com.
-access-key: ""
-secret-key: ""
+# When true, skip the periodic timer and back up before shutdown instead.
+# A first backup still runs at startup if no successful backup is recorded.
+extreme: false
+
+# Extreme-mode shutdown backup is skipped for shorter server sessions.
+extreme-min-session-minutes: 30

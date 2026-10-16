@@ -4,7 +4,7 @@ plugins {
 }
 
 group = "dev.tinyvault"
-version = "1.0.3"
+version = "1.0.4"
 
 java {
     toolchain {
@@ -20,8 +20,10 @@ repositories {
 
 dependencies {
     compileOnly("io.papermc.paper:paper-api:26.2.build.+")
-    implementation("software.amazon.awssdk:s3:2.55.16")
-    implementation("software.amazon.awssdk:url-connection-client:2.55.16")
+    implementation("com.google.code.gson:gson:2.13.1")
+    testImplementation("org.junit.jupiter:junit-jupiter:5.12.2")
+    testImplementation("org.yaml:snakeyaml:2.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 tasks {
@@ -37,7 +39,10 @@ tasks {
     shadowJar {
         archiveClassifier = ""
         mergeServiceFiles()
-        relocate("software.amazon.awssdk", "dev.tinyvault.shaded.awssdk")
+        relocate("com.google.gson", "dev.tinyvault.shaded.gson")
+    }
+    test {
+        useJUnitPlatform()
     }
     build {
         dependsOn(shadowJar)

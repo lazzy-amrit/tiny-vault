@@ -51,12 +51,13 @@ final class BackupCoordinator {
     }
 
     private final Plugin plugin;
-    private final S3BackupStore store;
+    private final BlompSwiftStore store;
     private final ServerArchiver archiver;
     private final BackupState state;
     private final DiscordWebhook webhook;
     private final Duration backupInterval;
-    private final boolean fileLuMode;
+    private final ZoneId timezone;
+    private final String namePattern;
     private final boolean extreme;
     private final Duration minSession;
     private final Path tempDir;
@@ -70,15 +71,16 @@ final class BackupCoordinator {
     });
     private BukkitTask checkTask;
 
-    private BackupCoordinator(Plugin plugin, S3BackupStore store, ServerArchiver archiver, BackupState state,
-                              Duration backupInterval, boolean fileLuMode, boolean extreme, Duration minSession,
-                              DiscordWebhook webhook) {
+    private BackupCoordinator(Plugin plugin, BlompSwiftStore store, ServerArchiver archiver, BackupState state,
+                              Duration backupInterval, ZoneId timezone, String namePattern,
+                              boolean extreme, Duration minSession, DiscordWebhook webhook) {
         this.plugin = plugin;
         this.store = store;
         this.archiver = archiver;
         this.state = state;
         this.backupInterval = backupInterval;
-        this.fileLuMode = fileLuMode;
+        this.timezone = timezone;
+        this.namePattern = namePattern;
         this.extreme = extreme;
         this.minSession = minSession;
         this.webhook = webhook;
@@ -87,30 +89,24 @@ final class BackupCoordinator {
 
     static BackupCoordinator create(Plugin plugin) throws IOException {
         var config = plugin.getConfig();
-        String bucket = config.getString("bucket", "").strip();
-        String accessKey = config.getString("access-key", "").strip();
-        String secretKey = config.getString("secret-key", "");
-        if (bucket.isBlank() || accessKey.isBlank() || secretKey.isBlank()) {
-            throw new IllegalStateException("bucket, access-key and secret-key must be set in plugins/TinyVault/config.yml");
+        String username = config.getString("username", "").strip();
+        String password = config.getString("password", "");
+        if (username.isBlank() || password.isBlank()) {
+            throw new IllegalStateException("username and password must be set in plugins/TinyVault/config.yml");
         }
-        String endpoint = sanitizeUrl(config.getString("endpoint", "https://ap.s5lu.com"));
-        if (endpoint.isBlank()) {
-            endpoint = "https://ap.s5lu.com";
-        }
-        if (!endpoint.matches("https?://[^\\s]+")) {
-            throw new IllegalStateException("endpoint in config.yml looks invalid ('" + endpoint
-                    + "') — it must look like https://ap.s5lu.com (check for stray quotes around the value)");
-        }
-        String region = config.getString("region", "global").strip();
-        boolean pathStyle = config.getBoolean("path-style", true);
-        String mode = config.getString("mode", "s3").strip();
-        boolean fileLuMode = mode.equalsIgnoreCase("s5");
-        String apiKey = config.getString("api-key", "");
-        FileLuTrashPurger trashPurger = fileLuMode
-                ? new FileLuTrashPurger(apiKey, message -> plugin.getLogger().warning(message))
-                : new FileLuTrashPurger("", null);
+        String dir = config.getString("dir", "tinyvault").strip();
+        int limit = Math.max(1, Math.min(100, config.getInt("limit", 3)));
         String timerRaw = config.getString("timer", "24");
         Duration backupInterval = parseInterval(timerRaw);
+        ZoneId timezone;
+        try {
+            timezone = ZoneId.of(config.getString("timezone", "Asia/Kolkata").strip());
+        } catch (Exception e) {
+            timezone = ZoneId.of("Asia/Kolkata");
+        }
+        // one universal naming method: time-format decides 24h vs 12h (AM/PM)
+        boolean twelveHour = "12".equalsIgnoreCase(config.getString("time-format", "24").strip());
+        String namePattern = twelveHour ? "yyyy-MM-dd_hh.mm-a" : "yyyy-MM-dd_HH.mm";
         boolean extreme = config.getBoolean("extreme", false);
         long minSessionMinutes = config.getLong("extreme-min-session-minutes", DEFAULT_MIN_SESSION_MINUTES);
         Duration minSession = Duration.ofMinutes(Math.max(1, minSessionMinutes));
@@ -119,11 +115,11 @@ final class BackupCoordinator {
 
         BackupState state = new BackupState(plugin.getDataFolder().toPath().resolve("state.txt"));
         state.load();
-        S3BackupStore store = new S3BackupStore(endpoint, region, pathStyle, bucket, accessKey, secretKey,
-                fileLuMode, trashPurger, plugin.getLogger()::warning);
+        BlompSwiftStore store = new BlompSwiftStore(username, password, dir, limit,
+            plugin.getLogger()::warning);
         ServerArchiver archiver = new ServerArchiver(serverRoot(plugin), plugin.getDataFolder().toPath());
-        return new BackupCoordinator(plugin, store, archiver, state, backupInterval, fileLuMode, extreme,
-                minSession, webhook);
+        return new BackupCoordinator(plugin, store, archiver, state, backupInterval, timezone,
+            namePattern, extreme, minSession, webhook);
     }
 
     /**
@@ -159,15 +155,6 @@ final class BackupCoordinator {
     }
 
     /**
-     * Config values that were pasted from chat or the console often arrive
-     * wrapped in quotes or commas. Strip those so a copy-paste can't stop the
-     * plugin from starting.
-     */
-    private static String sanitizeUrl(String raw) {
-        return DiscordWebhook.sanitizeWebhookUrl(raw);
-    }
-
-    /**
      * The server directory is the one containing the plugins folder. The data
      * folder path may be relative, so it is resolved against the working
      * directory before walking up; with an unexpected folder layout this falls
@@ -185,7 +172,8 @@ final class BackupCoordinator {
     void start() {
         sessionStart = Instant.now();
         Instant last = state.lastSuccess();
-        plugin.getLogger().info("Rotation mode: " + (fileLuMode ? "s5 (FileLu)" : "s3 (universal)"));
+        plugin.getLogger().info("Storage: Blomp Swift (" + (store.containerName()) + ")"
+                + " — auth via " + store.describeConnection());
         if (extreme) {
             plugin.getLogger().info("Extreme mode ON: the " + formatInterval(backupInterval) + " timer is skipped — "
                     + "backups run automatically before the server stops (sessions of at least "
@@ -208,7 +196,7 @@ final class BackupCoordinator {
         return state;
     }
 
-    S3BackupStore store() {
+    BlompSwiftStore store() {
         return store;
     }
 
@@ -298,7 +286,7 @@ final class BackupCoordinator {
             }
 
             phase = Phase.UPLOADING;
-            String storedKey = store.rotate(archive, Files.size(archive), startedAt);
+            String storedKey = store.uploadBackup(archive, startedAt, timezone, namePattern);
             state.recordSuccess(startedAt);
             long archiveSize = Files.size(archive);
             plugin.getLogger().info(String.format(

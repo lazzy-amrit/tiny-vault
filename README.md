@@ -1,169 +1,127 @@
-# TinyVault
+# TinyVault 1.0.4
 
-# ⚠️ NOT MADE FOR NORMAL USE ⚠️
-
-**It is not made to be used normally — it was built for personal work.**
-
-**Kindly read the code once and compile it according to your own work.**
-**The base is done for you in a good way.**
-
-Minimal Paper plugin that backs up the entire server directory to FileLu S5
-(S3-compatible) object storage and keeps exactly two remote ZIP archives:
-
-- `backups/current.zip` — latest successful backup
-- `backups/old.zip` — previous successful backup
-
-Backups run on a `timer` interval you set yourself — `24h` (default), `4h`,
-or minutes like `15m` (`m` = minutes, `h` = hours; a plain unsuffixed number
-stays hours for older configs) — or, with `extreme: true`, automatically
-right before the server stops.
+TinyVault is a Paper plugin that creates one ZIP of the server directory and stores it in Blomp using the OpenStack Swift-compatible API. Backups are scheduled, can be started manually, and retain a configurable number of TinyVault-managed archives.
 
 ## Requirements
 
-- Paper 26.2 (Minecraft's 2026 "26.2" release; the server runs on Java 25)
-- A FileLu folder enabled as an **S5 Bucket**, and S5 credentials from your
-  FileLu account (My Account -> S5 Access Key / Secret Key)
+- Paper 26.2 or compatible server, running Java 25.
+- A Blomp account with Swift API access enabled.
+- Gradle and a Java 25 toolchain to build.
 
-## Build
+## Build and install
 
-```bash
-gradle shadowJar
+Run:
+
+```sh
+gradle clean test shadowJar
 ```
 
-A Java 25 toolchain is provisioned automatically by Gradle. Output:
-`build/libs/TinyVault-1.0.1.jar`.
+The distributable is `build/libs/TinyVault-1.0.4.jar`. Install it in the server's `plugins/` directory and start the server once to create `plugins/TinyVault/config.yml`. Stop the server, enter Blomp credentials, then restart.
 
-## Install
+The generated configuration contains blank credential fields by design. Do not commit or share a populated config file.
 
-1. Copy the jar into the server's `plugins/` folder and start the server once.
-2. Fill in `plugins/TinyVault/config.yml`:
-   - `bucket` — the FileLu folder you enabled as an S5 Bucket
-     (file manager -> Edit Folder -> S5 Bucket -> Save)
-   - `access-key` / `secret-key` — S5 credentials generated under S5 settings in
-     My Account on filelu.com (not the WebDAV/FTP passwords)
-   - `endpoint` — defaults to `https://ap.s5lu.com` (Asia Pacific); regional
-     alternatives are `https://us.s5lu.com`, `https://eu.s5lu.com`,
-     `https://me.s5lu.com` (the global host from FileLu docs is
-     `https://s5lu.com`)
-   - `region` — FileLu's documented default is `global`; endpoint-specific
-     values are `us-east`, `eu-central`, `ap-southeast`, `me-central`
-   - `timer` — backup interval with unit suffix: `"15m"` = every 15
-     **m**inutes, `"4h"` = every 4 **h**ours (plain `24` = 24 hours, for
-     older configs). Nothing goes beyond hours: there is no `d` for days —
-     days are expressed in hours.
-   - `webhook-url` — optional Discord webhook URL (see the Webhooks section
-     below). Empty = no Discord announcements.
-   - `extreme` — `true` forgets the timer entirely: a backup runs
-     automatically right before the server stops, and a manual backup in
-     flight is always waited for. Sessions shorter than
-     `extreme-min-session-minutes` (default 30) are skipped, so quick
-     start/stop testing rounds never trigger backups; a one-time startup
-     backup still happens if the bucket never received a successful backup.
-   - `timezone` — IANA zone for command output (default `Asia/Kolkata`),
-     e.g. `Asia/Dhaka`, `Europe/Berlin`, `UTC`
-   Keep this file private — it contains credentials.
-3. Restart the server.
+## Blomp connection and destination
 
-## Discord webhooks
+TinyVault uses Blomp's Swift-compatible authentication at `https://authenticate.blomp.com` —
+Keystone **v3** first (your email as the user, password method, `Default` domain) with a
+documented **v2.0** (`tenantName: storage`) fallback. The token and the storage URL come from
+the token's service catalog; the plugin caches both and re-authenticates on 401. Credentials
+and tokens are never logged.
 
-TinyVault can announce every backup on a Discord channel. In Discord:
-**Server Settings → Integrations → Webhooks → New Webhook → (pick a channel) →
-Copy Webhook URL**, and paste that URL into `webhook-url` in the plugin's
-`config.yml`. Announcements fire at three moments, as colored embeds:
+The `dir` setting is a Swift container plus optional object prefix — the default `tinyvault`
+keeps every ZIP in one clean container. For example:
 
-- **Backup started** (blue) — the trigger (timer schedule, `/vault back`,
-  server shutdown…), plus a note that the whole server is being saved and
-  autosaves are paused meanwhile.
-- **Backup completed** (green) — archive size, how long it took, and when
-  the next one is due.
-- **Backup failed** (red) — a plain-language explanation of what happened,
-  plus the raw technical error for digging.
+```yaml
+username: "your-blomp-account@example.com"
+password: "your-blomp-password"
+dir: "tinyvault"
+limit: 3
+timer: "24h"
+```
 
-Notes:
+The container is created on the first backup if it does not exist. The server directory itself
+remains the backup source, matching prior TinyVault behavior.
 
-- Announcements are optional — leave `webhook-url` empty and nothing is sent.
-- Posting happens on its own background thread: Discord being slow or down
-  never delays a backup and never blocks server shutdown.
-- A failed announcement only appears as a one-line warning in the server log;
-  it never counts as a backup failure.
-- The webhook never leaks your storage credentials — messages only contain
-  sizes, durations, triggers and failure reasons.
+## Backup names, limit and no-trash deletion
 
-## Behavior
+Names follow one universal rule with no separate format option: `backup-<date time>-<millis>.zip`
+stamped in the configured `timezone`, styled by `time-format` — `24` produces names like
+`backup-2026-10-16_18.44-…zip`, `12` puts AM/PM into the name (`backup-2026-10-16_06.44-PM-…zip`).
 
-- On startup the plugin reads `plugins/TinyVault/state.txt`. If the `timer`
-  deadline of the last successful backup is already overdue, a backup starts
-  immediately; otherwise it runs when the deadline passes (checked every five
-  minutes, so it never backs up early and catches up right after the deadline).
-  With `extreme: true` the schedule is skipped completely and backups happen
-  at server shutdown instead (see the config section above).
-- New uploads are verified by content, not just by HEAD metadata: FileLu's
-  gateway can keep serving the metadata of the *previous* object for minutes
-  after an overwrite, which used to cause false "expected N bytes" failures.
-  Verification now recognizes that stale state, waits with growing backoff
-  (over twenty minutes total), and reads the tail of the stored object
-  directly with a ranged GET — actual object bytes prove the upload landed,
-  so the wait usually ends after one check instead of failing the run.
-- Each run: all worlds and player data are saved on the main thread (autosave
-  is paused while the archive is written and restored afterwards), then the
-  whole server directory — excluding TinyVault's own folder, which holds the
-  state file, config and temp archives — is streamed into one ZIP.
-- Two-slot rotation with the literal names `backups/current.zip` (latest)
-  and `backups/old.zip` (previous). Live testing against FileLu's real S5
-  gateway showed it breaks objects on *overwrite* and on *re-create after
-  delete* (HEAD and the listing keep showing the object, but the next GET
-  returns 404 — a "ghost" that HEAD-only verification happily passed), so
-  the FileLu flow is built defensively:
-  1. The previous `current.zip` is downloaded to a local safety copy kept on
-     disk (never deleted, refreshed every successful run).
-  2. Both remote names are deleted, and FileLu's trash is purged with the
-     account `api-key` — only a purged name can re-bind cleanly on FileLu.
-  3. The new archive uploads as `current.zip` and is verified by READING it
-     back (zip magic bytes via plain GET, not trusting HEAD metadata); a
-     ghost is deleted and re-uploaded, up to three tries.
-  4. The local safety copy uploads as `old.zip`, verified the same way.
-  5. FileLu trash is purged again, leaving nothing behind.
-  If a verify still fails, the run fails BEFORE the final purge, so the
-  trash still holds the deleted backups for recovery — nothing is silently
-  lost. Standard S3 (CopyObject-capable providers) uses the same two names
-  with a server-side copy.
-- Archives larger than 64 MiB are uploaded as S3 multipart (64 MiB parts, up
-  to three in parallel) because FileLu's gateway rejects long single-request
-  PUTs. Interrupted uploads are aborted immediately, and any leftover
-  multipart uploads are aborted at the start of the next run so partial parts
-  never consume quota. For multipart objects the checksum check falls back to
-  size-only (multipart ETags are not MD5).
-- FileLu S5's gateway does not support server-side CopyObject (returns 500),
-  so the previous backup is preserved by downloading it locally during the
-  run and re-uploading it to `last.zip`. Only PUT / HEAD / GET / DELETE are
-  used, with path-style addressing.
-- `state.txt` keeps the last 5 successful timestamps, the last 10 failures
-  with brief reasons, and the current status under `#Timestamps`, `#failures`
-  and `#current`. It is updated atomically (temp file + move) and only marked
-  successful after the new remote backup is confirmed.
-- All archive and upload work runs off the main thread. Temporary archives
-  live in `plugins/TinyVault/tmp/` and are deleted after every attempt.
+`limit` (default 3) is how many managed backups may exist at peak. After a new backup uploads
+and verifies, the oldest ones beyond the limit are removed for real — Swift has no trash bin.
+Unrelated files in the container are never touched. Verify happens through Swift's ETag
+checksum: if an upload arrives corrupted it is deleted immediately and the next run retries.
 
-## Storage quota and FileLu trash warning
+## Backups and retention
 
-FileLu S5 quota is shared per bucket/folder (1 GB by default on typical plans).
-At any moment during rotation at most two archives exist remotely:
-2 x ~370 MB = ~740 MB of the 1 GB quota. If your archive grows beyond roughly
-half the free quota, the rotation will fail with a quota error; TinyVault then
-reports the failure, keeps the surviving backups, and retries at the next
-deadline — it never deletes the only valid backup to make room.
+Each run saves worlds and player data, briefly pauses world autosaving while it writes the
+archive, then streams the server tree into one ZIP. TinyVault's own plugin data directory is
+excluded, so config, state, and temporary ZIPs cannot be included recursively. The ZIP is
+uploaded as one Swift object (Swift's own 5 GiB limit covers it) and verified through the
+returned ETag (md5).
 
-**FileLu trash:** every S3 DELETE lands in FileLu's trash (deleted backups
-are re-sent from there if you need recovery). If FileLu counts trash contents
-against your quota, empty the trash from the FileLu web UI periodically — the
-S3 API cannot purge it. TinyVault deletes are conditional (existing objects
-only) and never create random leftover objects, so trash entries come only
-from intentional rotations (one per run: the oldest backup).
+**Known Blomp-side caveat:** as of building this version, Blomp's storage proxy
+(`swiftproxy…:8080`) returns HTTP 403 to every valid token for some accounts/periods — an
+outage documented since March 2026 on their own forum. TinyVault's commands will say
+"Blomp's storage proxy refused the API call" when that happens; the credentials never leak
+into such messages and the plugin retries on the next scheduled run automatically.
 
-## Limits
+Object names follow one universal rule — `time-format` only, no separate filename pattern:
 
-- Single-request uploads are capped at 5 GiB by the S3 API; archives must stay
-  below that.
-- The FileLu folder must be enabled as an S5 bucket first; TinyVault does not
-  create buckets.
+```text
+backup-<date-time-stamp-in-timezone>-<epoch-milliseconds>.zip
+```
 
+24-hour mode gives `backup-2026-10-16_18.44-…zip`; 12-hour mode puts AM/PM into the name.
+The epoch suffix prevents collisions between backups that share a formatted stamp.
+
+After a successful upload (verified by ETag checksum), TinyVault lists the container/prefix
+and removes only its own `backup-*.zip` objects beyond `limit`, oldest first. It never deletes
+unrelated objects. A failed upload does not start retention cleanup, preserving prior valid
+backups. If cleanup itself fails after upload, the new backup remains and a warning is logged;
+cleanup can be retried on a later run.
+
+Swift object uploads are single PUT requests. Standard Swift deployments commonly cap a single
+object at 5 GiB; check your Blomp account/API limits for your plan. Archives exceeding provider
+limits fail without intentionally deleting existing backups.
+
+## Configuration
+
+- `timer`: backup interval such as `15m`, `4h`, or `24h`. A plain number remains hours. Minimum is one minute.
+- `timezone`: IANA zone used for filenames and command output, for example `Asia/Kolkata`, `Europe/Berlin`, or `UTC`.
+- `time-format`: `24` for 24-hour names like `backup-2026-10-16_18.44-…`, `12` for names that carry AM/PM.
+- `webhook-url`: optional Discord webhook for start, success, and failure messages. Leave blank to disable. Webhook delivery runs asynchronously and never blocks a backup.
+- `extreme`: when `true`, skips periodic backups and backs up before server shutdown instead. A first backup still starts at startup when no success has been recorded.
+- `extreme-min-session-minutes`: minimum server session length before an extreme-mode shutdown backup, default `30`.
+- `limit`: number of managed backups to retain, default `3`.
+
+## Commands
+
+`/vault` is the existing command family; existing subcommands remain available:
+
+- `/vault detail` shows status and recent remote backup objects. It remains available to all players.
+- `/vault back` starts a manual backup.
+- `/vault list` displays recorded successful backup times.
+- `/vault fails` displays recent failures.
+- `/vault passes` displays successful backup history.
+- `/vault storage` refreshes Swift account metadata and shows used space, total quota, and available space when Blomp exposes those values.
+- `/vault files [page]` lists visible containers, object paths, folder-like prefixes, and sizes, 20 entries per page.
+
+All commands except `/vault detail` require operator status or the `tinyvault.admin` permission. Storage inspection is read-only. It does not offer bulk deletion or other destructive operations.
+
+Swift account metadata commonly includes `X-Account-Bytes-Used`. A total quota is not guaranteed by the Swift API and may not be provided by Blomp; if unavailable, `/vault storage` says so rather than estimating or displaying a hardcoded plan size. The `available` field is only computed when both used bytes and a reported quota are present.
+
+## Troubleshooting
+
+- **Authentication fails:** check the Blomp account email/password, account status, and Swift access. TinyVault uses the Swift-compatible API credentials, not S3 keys.
+- **Swift token or storage URL missing:** Blomp authentication did not return the expected Swift headers. Check current Blomp API availability and the configured network path.
+- **Container or upload rejected:** check the `dir` container/prefix, account permissions, provider object-size limits, and available Blomp storage.
+- **Quota shows unavailable:** the account's Swift endpoint did not return a quota metadata header. This is an API limitation, not a displayed estimate.
+- **`/vault files` is incomplete or fails:** verify the credentials can list the account and inspect the server log for the HTTP status. The listing is restricted to the authenticated account's Swift-visible containers and objects.
+- **Discord messages do not appear:** verify the webhook URL and channel permissions. Webhook failures are warnings only and do not fail a backup.
+- **Backup schedule is unexpected:** check `timer`, `extreme`, and the latest status with `/vault detail`. Extreme mode disables the timer and uses the minimum-session gate at shutdown.
+
+## Reference archive
+
+`archive/` contains the previous 1.0.3 materials, including its source tree, build file, README, and JAR. That implementation used the older S3/FileLu-oriented storage code and includes the known bug-affected behavior; it is retained for reference only. The active implementation is under `src/` and targets Blomp Swift.

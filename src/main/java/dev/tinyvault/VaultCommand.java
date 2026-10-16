@@ -18,11 +18,12 @@ import java.util.Map;
 /**
  * /vault command family with structured, newest-first output.
  * - detail: open to everyone, as proof that backups are being made.
- * - back / list / fails / passes: operator only.
+ * - back / list / fails / passes / storage / files: operator only.
  * Times are shown in the zone configured under `timezone` (default Asia/Kolkata).
  */
 final class VaultCommand implements CommandExecutor, TabCompleter {
-    private static final List<String> SUBCOMMANDS = List.of("detail", "back", "list", "fails", "passes");
+        private static final List<String> SUBCOMMANDS =
+            List.of("detail", "back", "list", "fails", "passes", "storage", "files");
 
     private final TinyVaultPlugin plugin;
     private final BackupCoordinator coordinator;
@@ -78,6 +79,25 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
                     showPasses(sender);
                 }
             }
+            case "storage" -> {
+                if (requireOperator(sender)) {
+                    showStorage(sender);
+                }
+            }
+            case "files" -> {
+                if (requireOperator(sender)) {
+                    int page = 1;
+                    if (args.length > 1) {
+                        try {
+                            page = Math.max(1, Integer.parseInt(args[1]));
+                        } catch (NumberFormatException e) {
+                            sender.sendMessage("[TinyVault] Page must be a positive number.");
+                            return true;
+                        }
+                    }
+                    showFiles(sender, page);
+                }
+            }
             default -> sendUsage(sender);
         }
         return true;
@@ -94,7 +114,7 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
     }
 
     private void sendUsage(CommandSender sender) {
-        sender.sendMessage("Usage: /vault <detail|back|list|fails|passes> (back, list, fails, passes are operator only)");
+        sender.sendMessage("Usage: /vault <detail|back|list|fails|passes|storage|files [page]>");
     }
 
     private boolean requireOperator(CommandSender sender) {
@@ -106,11 +126,19 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
     }
 
     private String header(String title) {
-        return "----[ TinyVault · " + title + " ]----";
+        return "╭─✦ TinyVault · " + title + " ✦";
+    }
+
+    private String line() {
+        return "╰───────────────────────────────────────";
     }
 
     private String field(String label, String value) {
-        return String.format(Locale.ROOT, " %-15s %s", label, value);
+        return String.format(Locale.ROOT, "│ %-16s %s", label, value);
+    }
+
+    private String plain(String text) {
+        return "│ " + text;
     }
 
     private String sizeText(Long size) {
@@ -135,17 +163,20 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
 
                 sender.sendMessage(header("backup status"));
                 sender.sendMessage(field("timezone:", zone.toString()));
-                Map<String, Long> slots = coordinator.store().slots();
-                boolean first = true;
-                for (Map.Entry<String, Long> slot : slots.entrySet()) {
-                    String label = first ? "latest:" : "one behind:" ;
-                    first = false;
-                    String name = slot.getKey().startsWith(S3BackupStore.PREFIX)
-                            ? slot.getKey().substring(S3BackupStore.PREFIX.length()) : slot.getKey();
-                    sender.sendMessage(field(label + "  ", name + "  " + sizeText(slot.getValue())));
-                }
-                if (slots.isEmpty()) {
-                    sender.sendMessage(field("slots:", "none found"));
+                try {
+                    Map<String, Long> slots = coordinator.store().backupSlots();
+                    boolean first = true;
+                    for (Map.Entry<String, Long> slot : slots.entrySet()) {
+                        sender.sendMessage(field(first ? "latest:" : "behind:", slot.getKey()
+                                .substring(slot.getKey().lastIndexOf('/') + 1)
+                                .replaceAll("-\\d{13}\\.zip$", "") + "  " + sizeText(slot.getValue())));
+                        first = false;
+                    }
+                    if (slots.isEmpty()) {
+                        sender.sendMessage(plain("no backups on storage yet — run /vault back"));
+                    }
+                } catch (Exception e) {
+                    sender.sendMessage(field("remote:", "unavailable (" + safeMessage(e) + ")"));
                 }
                 sender.sendMessage(field("extreme:", coordinator.isExtreme()
                         ? "ON — backup before shutdown (min session " + coordinator.minSessionMinutes() + " min)"
@@ -157,10 +188,91 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
                 sender.sendMessage(field("next due:", coordinator.isExtreme()
                         ? "excused — extreme mode backs up at shutdown"
                         : (nextDue.equals(Instant.EPOCH) ? "now (overdue)" : fullTime.format(nextDue))));
-                sender.sendMessage(field("failures 48h:", recentFailedCount + "  (recorded total: "
-                        + snapshot.failures().size() + ")"));
+                sender.sendMessage(field("failures 48h:", recentFailedCount + "  (" + snapshot.failures().size()
+                        + " recorded all-time)"));
+                sender.sendMessage(line());
             }
         }.runTaskAsynchronously(plugin);
+    }
+
+    private void showStorage(CommandSender sender) {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                try {
+                    BlompSwiftStore.StorageInfo info = coordinator.store().storageInfo();
+                    sender.sendMessage(header("blomp account storage"));
+                    sender.sendMessage(field("used:", BlompSwiftStore.gbText(info.usedBytes())));
+                    sender.sendMessage(field("quota:", BlompSwiftStore.gbText(info.quotaBytes())));
+                    sender.sendMessage(field("available:", BlompSwiftStore.gbText(info.freeBytes())));
+                    sender.sendMessage(field("when full:", "oldest backups are removed beyond the limit — "
+                            + "free space is only for you"));
+                    sender.sendMessage(line());
+                } catch (Exception e) {
+                    sender.sendMessage(header("blomp account storage"));
+                    sender.sendMessage(field("status:", "unavailable (" + safeMessage(e) + ")"));
+                    sender.sendMessage(plain("this usually means Blomp's Swift API is having an outage "
+                            + "when every method 403s — try again later"));
+                    sender.sendMessage(line());
+                }
+            }
+        }.runTaskAsynchronously(plugin);
+    }
+
+    private void showFiles(CommandSender sender, int page) {
+        new BukkitRunnable() {
+            @Override
+            public void run() {
+                try {
+                    List<BlompSwiftStore.StorageEntry> entries = coordinator.store().listContents();
+                    int pageSize = 20;
+                    int pages = Math.max(1, (entries.size() + pageSize - 1) / pageSize);
+                    int selectedPage = Math.min(page, pages);
+                    sender.sendMessage(header("blomp files · page " + selectedPage + " of " + pages));
+                    int from = (selectedPage - 1) * pageSize;
+                    int to = Math.min(entries.size(), from + pageSize);
+                    if (entries.isEmpty()) {
+                        sender.sendMessage(plain("empty — nothing is stored yet"));
+                    }
+                    for (int index = from; index < to; index++) {
+                        BlompSwiftStore.StorageEntry entry = entries.get(index);
+                        sender.sendMessage(plain((entry.directory() ? "▸ " : "  ") + entry.path()
+                                + (entry.directory() ? "" : "   " + byteText(entry.sizeBytes()))));
+                    }
+                    if (pages > 1) {
+                        sender.sendMessage(field("pages:", "/vault files " + Math.max(1, selectedPage - 1)
+                                + "  ·  next: /vault files " + Math.min(pages, selectedPage + 1)));
+                    }
+                    sender.sendMessage(entryCountLine(entries));
+                } catch (Exception e) {
+                    sender.sendMessage(header("blomp files"));
+                    sender.sendMessage(field("status:", "unavailable (" + safeMessage(e) + ")"));
+                    sender.sendMessage(line());
+                }
+            }
+        }.runTaskAsynchronously(plugin);
+    }
+
+    private String entryCountLine(List<BlompSwiftStore.StorageEntry> entries) {
+        int directories = 0;
+        int files = 0;
+        for (BlompSwiftStore.StorageEntry entry : entries) {
+            if (entry.directory()) {
+                directories++;
+            } else {
+                files++;
+            }
+        }
+        return line() + "  (" + directories + " dirs, " + files + " files)";
+    }
+
+    private String byteText(Long bytes) {
+        return bytes == null ? "size unavailable"
+                : String.format(Locale.ROOT, "%.2f MB", bytes / 1_000_000.0);
+    }
+
+    private static String safeMessage(Exception exception) {
+        return exception.getMessage() == null ? exception.getClass().getSimpleName() : exception.getMessage();
     }
 
     private void startManualBackup(CommandSender sender) {
@@ -169,8 +281,8 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             return;
         }
         Instant previousLastSuccess = coordinator.state().lastSuccess();
-        sender.sendMessage("----[ TinyVault · backup starting ]----");
-        sender.sendMessage("  progress updates arrive every couple of minutes — hang tight.");
+        sender.sendMessage(header("backup starting"));
+        sender.sendMessage(plain("progress updates arrive as the work moves — hang tight."));
         new BukkitRunnable() {
             private BackupCoordinator.Phase lastAnnounced = BackupCoordinator.Phase.IDLE;
             private boolean sawRunning = false;
@@ -207,27 +319,26 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             private void finishReport(Instant baseline) {
                 BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
                 if (snapshot.lastSuccess() != null && !snapshot.lastSuccess().equals(baseline)) {
-                    sender.sendMessage("----[ TinyVault · backup complete ]----");
-                    sender.sendMessage("  done:          uploaded, verified and recorded");
-                    sender.sendMessage("  recorded at:   " + fullTime.format(snapshot.lastSuccess()));
-                    sender.sendMessage("  kept:          an older copy always sits one slot behind");
-                    sender.sendMessage("  nothing was lost — your worlds and player data are on storage.");
+                    sender.sendMessage(header("backup complete"));
+                    sender.sendMessage(plain("saved, verified by checksum and recorded on storage"));
+                    sender.sendMessage(field("recorded:", fullTime.format(snapshot.lastSuccess())));
+                    sender.sendMessage(plain("the previous backup still sits one step behind — nothing lost."));
+                    sender.sendMessage(line());
                 } else {
                     String raw = snapshot.failures().isEmpty() ? "" : snapshot.failures().get(0);
                     String reason = raw.contains(" | ") ? raw.substring(raw.indexOf(" | ") + 3) : raw;
-                    sender.sendMessage("----[ TinyVault · backup failed ]----");
-                    sender.sendMessage("  what happened:  " + friendlyReason(reason));
-                    sender.sendMessage("  technical:      " + (reason.isEmpty() ? "unknown" : reason));
-                    sender.sendMessage("  untouched:      your existing backups were NOT overwritten");
-                    sender.sendMessage("  next:           the next run retries automatically; "
-                            + "watch progress with /vault detail");
+                    sender.sendMessage(header("backup failed"));
+                    sender.sendMessage(plain("what happened: " + friendlyReason(reason)));
+                    sender.sendMessage(field("technical:", reason.isEmpty() ? "unknown" : reason));
+                    sender.sendMessage(plain("your existing backups were NOT touched — retry comes automatically."));
+                    sender.sendMessage(line());
                 }
             }
         }.runTaskTimerAsynchronously(plugin, 0L, 40L);
     }
 
     /**
-     * Turns S3/gateway error strings into something a person can actually act on.
+     * Turns storage error strings into something a person can actually act on.
      * Package-visible so the Discord webhook gets the same friendly wording.
      */
     static String friendlyReason(String reason) {
@@ -235,15 +346,25 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             return "no reason was recorded — check the server log";
         }
         String lower = reason.toLowerCase(Locale.ROOT);
+        if (lower.contains("403")) {
+            return "Blomp's storage proxy refused the API call — their side, not your setup "
+                    + "(their Swift API has had outages; the login itself works)";
+        }
+        if (lower.contains("connect timed out") || lower.contains("timed out after")
+                || lower.contains("authentication") && lower.contains("timed out")) {
+            return "Blomp's backend did not accept a connection in time — usually their API having "
+                    + "a hiccup; try again shortly";
+        }
         if (lower.contains("expected ") && lower.contains("bytes") || lower.contains("propagat")) {
             return "the storage service is still catching up with the fresh upload";
         }
-        if (lower.contains("checksum")) {
-            return "the uploaded archive was not readable as a whole just yet";
+        if (lower.contains("etag mismatch") || lower.contains("checksum")) {
+            return "the uploaded archive did not arrive intact — the corrupted copy was removed "
+                    + "and the next run will retry";
         }
         if (lower.contains("quota") || lower.contains("storage") && lower.contains("full")
-                || lower.contains("403") && lower.contains("exceed")) {
-            return "storage is full — free up space in the bucket or FileLu trash";
+                || lower.contains("exceed")) {
+            return "Blomp reports no space remaining for this container";
         }
         if (lower.contains("connection") || lower.contains("timed out") || lower.contains("timeout")
                 || lower.contains("unknownhost") || lower.contains("dns")) {
@@ -252,8 +373,9 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
         if (lower.contains("aborted") || lower.contains("interrupt")) {
             return "the upload was interrupted midway (server busy or connection dropped)";
         }
-        if (lower.contains("denied") || lower.contains("credentials")) {
-            return "storage refused the request — check access-key and secret-key in config.yml";
+        if (lower.contains("denied") || lower.contains("credentials") || lower.contains("cannot set up session")
+                || lower.contains("auth failed") || lower.contains("authorization failed")) {
+            return "Blomp refused the request — check username and password in config.yml";
         }
         return "storage did not accept the backup";
     }
@@ -263,41 +385,43 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
     private void showList(CommandSender sender) {
         BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
         LocalDate today = LocalDate.now(zone);
-        sender.sendMessage(header("recorded backups (latest first)"));
+        sender.sendMessage(header("recorded backups · latest first"));
         int index = 1;
         int todays = 0;
         for (Instant timestamp : snapshot.successes()) { // newest first
             boolean isToday = LocalDate.ofInstant(timestamp, zone).equals(today);
-            String when = isToday ? dayTime.format(timestamp) + " (today)" : fullTime.format(timestamp);
-            sender.sendMessage(" " + index + ".  " + when + markerFor(index));
+            String when = isToday ? dayTime.format(timestamp) + "  (today)" : fullTime.format(timestamp);
+            sender.sendMessage(plain(index + ".  " + when + markerFor(index)));
             if (isToday) {
                 todays++;
             }
             index++;
         }
         if (index == 1) {
-            sender.sendMessage(" none yet");
+            sender.sendMessage(plain("nothing recorded yet"));
         }
-        sender.sendMessage(" backups today: " + todays);
+        sender.sendMessage(plain("today: " + todays + " backup" + (todays == 1 ? "" : "s")));
+        sender.sendMessage(line());
     }
 
     private void showPasses(CommandSender sender) {
         BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
-        sender.sendMessage(header("passes (successful backups, latest first)"));
+        sender.sendMessage(header("passes · every recorded success"));
         if (snapshot.successes().isEmpty()) {
-            sender.sendMessage(" none yet");
+            sender.sendMessage(plain("clean slate — no passes yet"));
         }
         int index = 1;
         for (Instant timestamp : snapshot.successes()) {
-            sender.sendMessage(" " + index + ".  " + fullTime.format(timestamp) + markerFor(index));
+            sender.sendMessage(plain(index + ".  " + fullTime.format(timestamp) + markerFor(index)));
             index++;
         }
+        sender.sendMessage(line());
     }
 
     private void showFails(CommandSender sender) {
         BackupState.StateSnapshot snapshot = coordinator.state().snapshot();
         Instant cutoff = Instant.now().minus(Duration.ofHours(48));
-        sender.sendMessage(header("failures (last 48h, latest first)"));
+        sender.sendMessage(header("failures · last 48 hours"));
         int index = 1;
         int recent = 0;
         for (String failure : snapshot.failures()) { // newest first
@@ -307,13 +431,14 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             }
             recent++;
             String reason = failure.contains(" | ") ? failure.substring(failure.indexOf(" | ") + 3) : failure;
-            sender.sendMessage(" " + index + ".  " + fullTime.format(at));
-            sender.sendMessage("      what happened: " + friendlyReason(reason));
+            sender.sendMessage(plain(index + ".  " + fullTime.format(at)));
+            sender.sendMessage(field("what:", friendlyReason(reason)));
             index++;
         }
         if (index == 1) {
-            sender.sendMessage(" none in the last 48 hours");
+            sender.sendMessage(plain("none in the last 48 hours — nice and quiet"));
         }
+        sender.sendMessage(line());
     }
 
     private static Instant parseTime(String entry) {

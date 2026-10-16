@@ -2,8 +2,8 @@ name: TinyVault
 version: '${version}'
 main: dev.tinyvault.TinyVaultPlugin
 api-version: '26.2'
-description: Minimal automatic whole-server backups to S3-compatible storage.
+description: Scheduled whole-server backups to Blomp Swift storage.
 commands:
   vault:
     description: TinyVault backup status and controls
-    usage: /vault <detail|back|list|fails|passes>
+    usage: /vault <detail|back|list|fails|passes|storage|files [page]>
