@@ -6,10 +6,10 @@
 username: ""
 password: ""
 
-# Where backups live on Blomp: first segment is the Swift container, so the
-# default keeps zips under container "tinyvault". Change the container name
-# if you prefer your own.
-dir: "tinyvault"
+# Where backups live on Blomp. "auto" (recommended) uses the container named
+# after your account email — that's the only container Blomp lets accounts
+# write to — with objects under the tinyvault/ prefix inside it.
+dir: "auto"
 
 # How many TinyVault-managed ZIP backups to keep on Blomp. Every time a new
 # backup finishes uploading, the oldest ones beyond this number are removed

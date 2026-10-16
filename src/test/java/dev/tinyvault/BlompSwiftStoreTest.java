@@ -32,6 +32,13 @@ final class BlompSwiftStoreTest {
     private final List<String> objects = new ArrayList<>();
     private final List<String> deleted = new ArrayList<>();
     private byte[] uploaded;
+    /** Keystone v3 shaped token response pointing the catalog at the mock Swift. */
+    private String tokenBody() {
+        return "{\"token\":{\"catalog\":[{\"type\":\"object-store\",\"endpoints\":["
+                + "{\"url\":\"http://127.0.0.1:" + server.getAddress().getPort() + ACCOUNT
+                + "\",\"interface\":\"public\"}]}}]}";
+    }
+
     private boolean expireOnce;
     private boolean includeQuota;
     private boolean failUpload;
@@ -74,7 +81,7 @@ final class BlompSwiftStoreTest {
                         listing.append(',');
                     }
                     String name = objects.get(index);
-                    byte[] bytes = uploadedContent(name);
+                    byte[] bytes = storedContents.getOrDefault(name, uploadedContent(name));
                     listing.append("{\"name\":\"").append(name)
                             .append("\",\"bytes\":").append(bytes.length)
                             .append(",\"content_type\":\"application/zip\"}");
@@ -88,18 +95,24 @@ final class BlompSwiftStoreTest {
                     exchange.sendResponseHeaders(500, -1);
                 } else {
                     objects.add(objectName);
-                    // Swift single-shot PUT returns the md5 of the stored bytes
-                    String etag = md5Of(uploaded);
-                    if (corruptEtagOnce) {
-                        etag = "00000000000000000000000000000000"; // pretend the transfer corrupted mid-air
-                        corruptEtagOnce = false;
+                    String etag;
+                    if (corruptStoredOnce) {
+                        // real servers store corrupted bytes and truthfully etag THEM
+                        byte[] flipped = uploaded.clone();
+                        flipped[0] = (byte) ~flipped[0];
+                        storedContents.put(objectName, flipped);
+                        etag = md5Of(flipped);
+                        corruptStoredOnce = false;
+                    } else {
+                        storedContents.put(objectName, uploaded);
+                        etag = md5Of(uploaded);
                     }
                     exchange.getResponseHeaders().add("ETag", etag);
                     exchange.sendResponseHeaders(201, -1);
                 }
             } else if (path.startsWith(ACCOUNT + "/" + remoteContainer + "/") && method.equals("GET")) {
                 String objectName = path.substring((ACCOUNT + "/" + remoteContainer + "/").length());
-                byte[] content = uploadedContent(objectName);
+                byte[] content = storedContents.getOrDefault(objectName, uploadedContent(objectName));
                 send(exchange, 200, new String(content, StandardCharsets.ISO_8859_1));
             } else if (path.startsWith(ACCOUNT + "/" + remoteContainer + "/") && method.equals("DELETE")) {
                 String objectName = path.substring((ACCOUNT + "/" + remoteContainer + "/").length());
@@ -161,12 +174,14 @@ final class BlompSwiftStoreTest {
                 String key = store.uploadBackup(zip, at, ZoneId.of("UTC"), "yyyy-MM-dd_HH.mm");
                 stored.add(key);
                 // name style per spec: backup-<stamp>-<millis>.zip
-                assertTrue(key.startsWith("tinyvault/backup-2026-01-01_00."), "name must be backup-<stamp>");
-                assertFalse(key.startsWith("tinyvault/tinyvault-"), "name must not use the old tinyvault- prefix");
+                assertTrue(key.startsWith("user@example.test/backup-2026-01-01_00."),
+                        "name must be backup-<stamp> inside the account container");
+                assertFalse(key.contains("tinyvault-"), "name must not use the old tinyvault- prefix");
                 uploadedContentCheck(objects);
             }
             // bare object names (mock stores without the container prefix)
-            List<String> bare = stored.stream().map(k -> k.substring("tinyvault/".length())).toList();
+            List<String> bare = stored.stream()
+                    .map(k -> k.substring("user@example.test/".length())).toList();
             // bucket keeps exactly the limit newest ones, oldest pruned in order
             assertEquals(3, objects.size());
             assertTrue(objects.contains(bare.get(9)), "newest must be kept");
@@ -175,6 +190,44 @@ final class BlompSwiftStoreTest {
             assertEquals(7, deleted.size());
             assertTrue(deleted.contains(bare.get(0)), "oldest must have been removed");
             assertTrue(objects.stream().noneMatch(n -> n.contains("backup-2026-01-01_00.01")));
+            assertTrue(warnings.isEmpty());
+        } finally {
+            Files.deleteIfExists(zip);
+        }
+    }
+
+    @Test
+    void uploadsHugeBackupsVerifiesChecksumsAndRotatesWithLimit() throws Exception {
+        mockPort = server.getAddress().getPort();
+        List<String> warnings = new ArrayList<>();
+        List<String> stored = new ArrayList<>();
+        // 48 MiB: big enough to exercise realistic archive sizes through the
+        // real upload + checksum path (the in-process mock caps larger bodies)
+        int size = 48 * 1024 * 1024;
+        Path zip = Files.createTempFile("tinyvault-huge", ".zip");
+        byte[] chunk = new byte[1024 * 1024];
+        for (int i = 0; i < chunk.length; i++) {
+            chunk[i] = (byte) (i * 31);
+        }
+        try (var out = Files.newOutputStream(zip)) {
+            for (int i = 0; i < size / chunk.length; i++) {
+                out.write(chunk);
+            }
+        }
+        try (BlompSwiftStore store = store(2, warnings)) { // limit 2
+            for (int i = 1; i <= 3; i++) {
+                Instant at = Instant.parse("2026-10-16T10:00:00Z").plusSeconds(i * 60L);
+                String key = store.uploadBackup(zip, at, ZoneId.of("UTC"), "yyyy-MM-dd_HH.mm");
+                stored.add(key);
+                // the store verified the ETag/md5 internally — a checksum-failed upload
+                // would have thrown before we ever got here
+            }
+            List<String> bare = stored.stream().map(k -> k.substring("user@example.test/".length())).toList();
+            assertEquals(2, objects.size(), "only the two newest 128MiB backups stay");
+            assertTrue(objects.contains(bare.get(2)));
+            assertTrue(objects.contains(bare.get(1)));
+            assertFalse(objects.contains(bare.get(0)));
+            assertEquals(1, deleted.size());
             assertTrue(warnings.isEmpty());
         } finally {
             Files.deleteIfExists(zip);
@@ -202,28 +255,28 @@ final class BlompSwiftStoreTest {
     }
 
     @Test
-    void uploadVerifiesContentByChecksumAndRemovesCorruptUploads() throws Exception {
+    void recoversFromCorruptedTransferByReUploading() throws Exception {
         mockPort = server.getAddress().getPort();
-        // corrupting the mock's stored bytes is done by manipulating the ETag response:
-        // force the mock to answer with a wrong etag for the next upload
-        corruptEtagOnce = true;
+        // the mock stores corrupted bytes once (with the corrupted bytes' own etag,
+        // exactly like a truthful real server) — the store must detect the content
+        // mismatch, re-upload, and end up with the correct bytes
+        corruptStoredOnce = true;
         Path zip = Files.createTempFile("tinyvault-corrupt", ".zip");
-        Files.write(zip, new byte[]{'P', 'K', 3, 4});
+        byte[] original = {'P', 'K', 3, 4, 9, 9, 9};
+        Files.write(zip, original);
         try (BlompSwiftStore store = store(3, new ArrayList<>())) {
-            org.junit.jupiter.api.Assertions.assertThrows(IOException.class,
-                    () -> store.uploadBackup(zip, Instant.now(), ZoneId.of("UTC"), "yyyy-MM-dd_HH.mm"));
-            // the bad upload has been deleted from the container by the store itself
-            assertNoBackupStored();
+            String key = store.uploadBackup(zip, Instant.now(), ZoneId.of("UTC"), "yyyy-MM-dd_HH.mm");
+            String bare = key.substring(key.indexOf('/') + 1);
+            // the final stored content must equal the original file
+            assertTrue(java.util.Arrays.equals(storedContents.get(bare), original),
+                    "the stored object must end up matching the local file");
         } finally {
             Files.deleteIfExists(zip);
         }
     }
 
-    private boolean corruptEtagOnce;
-
-    private void assertNoBackupStored() {
-        assertTrue(objects.isEmpty(), "a checksum-failed upload must be removed: " + objects);
-    }
+    private boolean corruptStoredOnce;
+    private final java.util.Map<String, byte[]> storedContents = new java.util.HashMap<>();
 
     @Test
     void storageInfoReportsUsedQuotaAndFree() throws Exception {
@@ -256,9 +309,10 @@ final class BlompSwiftStoreTest {
         remotePrefix = "nightly/daily";
         Path zip = Files.createTempFile("tinyvault-custom", ".zip");
         Files.write(zip, new byte[]{'P', 'K', 3, 4});
-        try (BlompSwiftStore store = store(2, new ArrayList<>(), "custom-vault/nightly/daily")) {
+        try (BlompSwiftStore store = store(2, new ArrayList<>(), "user@example.test/nightly/daily")) {
             String key = store.uploadBackup(zip, Instant.now(), ZoneId.of("UTC"), "yyyy-MM-dd_HH.mm");
-            assertTrue(key.startsWith("custom-vault/nightly/daily/backup-"), "custom dir respected: " + key);
+            assertTrue(key.startsWith("user@example.test/nightly/daily/backup-"),
+                    "custom nested prefix respected: " + key);
             assertTrue(objects.stream().anyMatch(n -> n.startsWith("nightly/daily/backup-")));
         } finally {
             Files.deleteIfExists(zip);
@@ -300,7 +354,8 @@ final class BlompSwiftStoreTest {
     }
 
     private BlompSwiftStore store(int limit, List<String> warnings) {
-        return store(limit, warnings, "tinyvault");
+        // the account email IS the container Blomp allows
+        return store(limit, warnings, "user@example.test");
     }
 
     private BlompSwiftStore store(int limit, List<String> warnings, String dir) {

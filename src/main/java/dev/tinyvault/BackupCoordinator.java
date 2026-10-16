@@ -94,7 +94,7 @@ final class BackupCoordinator {
         if (username.isBlank() || password.isBlank()) {
             throw new IllegalStateException("username and password must be set in plugins/TinyVault/config.yml");
         }
-        String dir = config.getString("dir", "tinyvault").strip();
+        String dir = config.getString("dir", "auto").strip();
         int limit = Math.max(1, Math.min(100, config.getInt("limit", 3)));
         String timerRaw = config.getString("timer", "24");
         Duration backupInterval = parseInterval(timerRaw);

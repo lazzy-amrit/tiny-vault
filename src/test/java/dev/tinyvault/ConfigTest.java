@@ -16,7 +16,7 @@ final class ConfigTest {
         Map<String, Object> config = new Yaml().load(stream);
         assertEquals("", config.get("username"));
         assertEquals("", config.get("password"));
-        assertEquals("tinyvault", config.get("dir"));
+        assertEquals("auto", config.get("dir"));
         assertEquals(3, config.get("limit"));
         assertEquals("24h", config.get("timer"));
         assertEquals("Asia/Kolkata", config.get("timezone"));

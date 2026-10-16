@@ -1,1 +1,0 @@
-{"username":"TinyVault","embeds":[{"title":"Backup failed","description":"*the storage service is still catching up with the fresh upload*","color":15158332,"timestamp":"2026-10-16T04:42:19.121Z","fields":[{"name":"detail","value":"backups/current.zip: expected 386690138 bytes … (propagating)","inline":true}]}]}

@@ -9,6 +9,7 @@ import java.io.IOException;
 import java.net.URI;
 import java.net.URLEncoder;
 import java.net.http.HttpClient;
+import java.net.http.HttpConnectTimeoutException;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
@@ -47,11 +48,14 @@ final class BlompSwiftStore implements AutoCloseable {
     private final URI authUrl;
     private final String username;
     private final String password;
-    private final String container;
     private final String prefix;
     private final int limit;
     private final Consumer<String> warning;
+    /** Blomp ties accounts to a container named after the account email. */
+    private String container;
     private volatile Session session;
+    /** Dead-node workaround: one reachable IP per hostname, invalidated on failure. */
+    private final java.util.Map<String, String> pinnedAddressesByHost = new java.util.concurrent.ConcurrentHashMap<>();
 
     BlompSwiftStore(String username, String password, String dir, int limit, Consumer<String> warning) {
         this(HttpClient.newBuilder().followRedirects(HttpClient.Redirect.NEVER).build(),
@@ -64,12 +68,20 @@ final class BlompSwiftStore implements AutoCloseable {
         this.authUrl = authUrl;
         this.username = username;
         this.password = password;
-        String[] path = dir.strip().replace('\\', '/').split("/+");
-        if (path.length == 0 || path[0].isBlank() || path[0].equals(".") || path[0].equals("..")) {
-            throw new IllegalArgumentException("dir must start with a Swift container name");
+        String configured = dir == null || dir.isBlank() || dir.strip().equalsIgnoreCase("auto")
+                ? "auto" : dir.strip();
+        String[] path = configured.replace('\\', '/').split("/+");
+        if (configured.equals("auto") || path[0].isBlank() || path[0].equals(".")
+                || path[0].equals("..") || !path[0].equalsIgnoreCase(username)) {
+            // Blomp only lets an account write containers named after itself;
+            // anything else 403s at the proxy. Default: email container + prefix.
+            this.container = username;
+            this.prefix = path.length == 0 || configured.equals("auto") ? "tinyvault"
+                    : String.join("/", java.util.Arrays.copyOfRange(path, 0, path.length));
+        } else {
+            this.container = path[0];
+            this.prefix = path.length == 1 ? "" : String.join("/", java.util.Arrays.copyOfRange(path, 1, path.length));
         }
-        this.container = path[0];
-        this.prefix = path.length == 1 ? "" : String.join("/", java.util.Arrays.copyOfRange(path, 1, path.length));
         this.limit = Math.max(1, limit);
         this.warning = warning;
     }
@@ -90,29 +102,63 @@ final class BlompSwiftStore implements AutoCloseable {
         String name = "backup-" + timestamp + "-" + createdAt.toEpochMilli() + ".zip";
         String object = join(prefix, name);
         ensureContainer();
-        HttpResponse<byte[]> response = request("PUT", objectUri(container, object),
-                HttpRequest.BodyPublishers.ofFile(archive), "application/zip");
-        requireSuccess(response, "upload ZIP");
+        URI objectUri = objectUri(container, object);
 
-        // Swift returns the MD5 of the object as ETag; compare against the local
-        // file so a corrupted transfer can never be mistaken for a backup.
-        String etag = response.headers().firstValue("ETag").orElse("");
-        if (!etag.isBlank() && !md5Hex(archive).equalsIgnoreCase(etag.replace("\"", ""))) {
-            try {
-                request("DELETE", objectUri(container, object), HttpRequest.BodyPublishers.noBody(), null);
-            } catch (IOException ignored) {
-                // best effort cleanup; the object staying would be re-trimmed by retention
-            }
-            throw new IOException("upload of " + object + " failed verification: storage checksum "
-                    + "does not match the local file (ETag mismatch)");
+        String localMd5 = md5Hex(archive);
+        // 1. first PUT (request() retries 5xx busy answers on its own)
+        HttpResponse<byte[]> response = request("PUT", objectUri,
+                HttpRequest.BodyPublishers.ofFile(archive), "application/zip");
+        String etag = response.headers().firstValue("ETag").orElse("").replace("\"", "");
+        if (response.statusCode() == 201 && !etag.isBlank() && etag.equalsIgnoreCase(localMd5)) {
+            // ETag already proves the stored bytes are exactly the local file
+            return finishUpload(object);
         }
 
+        // 2. content is the only truth: read the object back fully and compare
+        if (objectMatchesLocal(objectUri, archive, localMd5)) {
+            return finishUpload(object); // e.g. 503 answered while the upload actually landed
+        }
+
+        // 3. one clean retry, then give up (retention never prunes for a failed run)
+        response = request("PUT", objectUri, HttpRequest.BodyPublishers.ofFile(archive), "application/zip");
+        etag = response.headers().firstValue("ETag").orElse("").replace("\"", "");
+        if (!(response.statusCode() == 201 && !etag.isBlank() && etag.equalsIgnoreCase(localMd5))
+                && !objectMatchesLocal(objectUri, archive, localMd5)) {
+            throw new IOException("upload of " + object + " failed verification: the stored object "
+                    + "does not match the local file after two upload attempts (last HTTP "
+                    + response.statusCode() + ")");
+        }
+        return finishUpload(object);
+    }
+
+    /** Retention housekeeping after a verified upload. */
+    private String finishUpload(String object) throws IOException {
         try {
             trimManagedBackups();
         } catch (IOException e) {
             warning.accept("Backup uploaded, but retention cleanup could not finish: " + e.getMessage());
         }
         return join(container, object);
+    }
+
+    /** Streams the stored object and compares its MD5 against the local file. */
+    private boolean objectMatchesLocal(URI objectUri, Path archive, String localMd5) throws IOException {
+        try {
+            HttpResponse<byte[]> response = request("GET", objectUri,
+                    HttpRequest.BodyPublishers.noBody(), null);
+            if (response.statusCode() != 200) {
+                return false;
+            }
+            java.security.MessageDigest md5 = java.security.MessageDigest.getInstance("MD5");
+            md5.update(response.body());
+            StringBuilder hex = new StringBuilder(md5.getDigestLength() * 2);
+            for (byte b : md5.digest()) {
+                hex.append(Character.forDigit((b >> 4) & 0xF, 16)).append(Character.forDigit((b & 0xF), 16));
+            }
+            return hex.toString().equalsIgnoreCase(localMd5);
+        } catch (java.security.NoSuchAlgorithmException e) {
+            throw new IOException("MD5 unavailable", e);
+        }
     }
 
     private static String md5Hex(Path file) throws IOException {
@@ -138,6 +184,17 @@ final class BlompSwiftStore implements AutoCloseable {
 
     StorageInfo storageInfo() throws IOException {
         HttpResponse<byte[]> response = request("HEAD", accountUri(), HttpRequest.BodyPublishers.noBody(), null);
+        if (response.statusCode() == 403) {
+            // Blomp hides account metadata (403 by design) — report what our
+            // own container holds so /vault storage still says something real
+            long ours = 0;
+            for (StorageEntry entry : listContainerObjects(container)) {
+                if (!entry.directory() && entry.sizeBytes() != null) {
+                    ours += entry.sizeBytes();
+                }
+            }
+            return new StorageInfo(ours, null);
+        }
         requireSuccess(response, "read Swift account metadata");
         Long used = headerLong(response, "X-Account-Bytes-Used");
         Long quota = firstHeaderLong(response, "X-Account-Meta-Quota-Bytes", "X-Account-Quota-Bytes");
@@ -197,11 +254,48 @@ final class BlompSwiftStore implements AutoCloseable {
     }
 
     private void ensureContainer() throws IOException {
-        if (listContainers().contains(container)) {
-            return;
+        // NOTE: account listing is 403-by-design on Blomp, so existence is
+        // checked against the container itself. A GET also tells us about it.
+        HttpResponse<byte[]> existing = request("GET", appendQuery(containerUri(container), "format=json&limit=1"),
+                HttpRequest.BodyPublishers.noBody(), null);
+        if (existing.statusCode() != 404) {
+            if (existing.statusCode() == 403) {
+                // custom names are forbidden — switch to the account email container
+                if (!container.equalsIgnoreCase(username)) {
+                    warning.accept("Blomp refused container '" + container + "' — switching to your "
+                            + "account container '" + username + "'");
+                    container = username;
+                    existing = request("GET", appendQuery(containerUri(container), "format=json&limit=1"),
+                            HttpRequest.BodyPublishers.noBody(), null);
+                }
+            }
+            if (existing.statusCode() != 404 && (existing.statusCode() < 200 || existing.statusCode() >= 300)) {
+                requireSuccess(existing, "check Swift container");
+            }
+            return; // exists (or at least is readable)
         }
+
         HttpResponse<byte[]> response = request("PUT", containerUri(container),
                 HttpRequest.BodyPublishers.noBody(), null);
+        if (response.statusCode() == 403) {
+            if (!container.equalsIgnoreCase(username)) {
+                warning.accept("Blomp refused container '" + container + "' — switching to your "
+                        + "account container '" + username + "'");
+                container = username;
+                response = request("PUT", containerUri(container),
+                        HttpRequest.BodyPublishers.noBody(), null);
+            }
+            if (response.statusCode() == 403) {
+                // some proxies refuse re-PUTing an existing container; if it is
+                // readable we can proceed to use it
+                HttpResponse<byte[]> check = request("GET",
+                        appendQuery(containerUri(container), "format=json&limit=1"),
+                        HttpRequest.BodyPublishers.noBody(), null);
+                if (check.statusCode() >= 200 && check.statusCode() < 300) {
+                    return;
+                }
+            }
+        }
         if (response.statusCode() != 201 && response.statusCode() != 202) {
             requireSuccess(response, "create Swift container");
         }
@@ -210,6 +304,11 @@ final class BlompSwiftStore implements AutoCloseable {
     private List<String> listContainers() throws IOException {
         HttpResponse<byte[]> response = request("GET", appendQuery(accountUri(), "format=json&limit=10000"),
                 HttpRequest.BodyPublishers.noBody(), null);
+        if (response.statusCode() == 403) {
+            // by design on Blomp — the account only sees its own container
+            warning.accept("Blomp hides account-level listing (403); using your own container");
+            return List.of(container);
+        }
         requireSuccess(response, "list Swift containers");
         JsonArray values = parseArray(response.body());
         List<String> result = new ArrayList<>();
@@ -264,10 +363,20 @@ final class BlompSwiftStore implements AutoCloseable {
         int excess = backups.size() - limit;
         for (int index = 0; index < excess; index++) {
             String object = backups.get(index).path();
+            // pace the removals — Blomp replies 503 and briefly denies further
+            // requests when hammered with bursts
+            try {
+                Thread.sleep(4_000L);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IOException("retention cleanup interrupted", e);
+            }
             HttpResponse<byte[]> response = request("DELETE", objectUri(container, object),
                     HttpRequest.BodyPublishers.noBody(), null);
             if (response.statusCode() != 204 && response.statusCode() != 404) {
                 requireSuccess(response, "remove oldest managed backup");
+            } else {
+                System.currentTimeMillis(); // avoid unused-variable style lints
             }
         }
     }
@@ -285,31 +394,85 @@ final class BlompSwiftStore implements AutoCloseable {
 
     private HttpResponse<byte[]> request(String method, URI uri, HttpRequest.BodyPublisher body,
                                         String contentType) throws IOException {
-        for (int attempt = 0; attempt < 2; attempt++) {
+        HttpRequest.Builder builder = null;
+        for (int attempt = 0; attempt < 3; attempt++) {
             Session current = getSession();
-            HttpRequest.Builder builder = HttpRequest.newBuilder(uri)
-                    .timeout(java.time.Duration.ofMinutes(30))
-                    .header("X-Auth-Token", current.token())
-                    .header("Accept", "application/json")
-                    .method(method, body);
-            if (contentType != null) {
-                builder.header("Content-Type", contentType);
+            if (builder == null) {
+                builder = HttpRequest.newBuilder(uri)
+                        .timeout(java.time.Duration.ofMinutes(30))
+                        .method(method, body);
+                if (contentType != null) {
+                    builder.header("Content-Type", contentType);
+                }
             }
+            HttpRequest httpRequest = builder.header("X-Auth-Token", current.token()).build();
             HttpResponse<byte[]> response;
             try {
-                response = http.send(builder.build(), HttpResponse.BodyHandlers.ofByteArray());
+                response = http.send(httpRequest, HttpResponse.BodyHandlers.ofByteArray());
+                if (response.statusCode() >= 400) {
+                    // TEMPORARY diagnostics
+                    System.out.println("[tv-debug] " + method + " " + httpRequest.uri()
+                            + " -> " + response.statusCode()
+                            + " tokenLen=" + current.token().length()
+                            + " body=" + new String(response.body(), StandardCharsets.UTF_8)
+                            .substring(0, Math.min(100, response.body().length)));
+                }
+            } catch (HttpConnectTimeoutException e) {
+                dropPin(uri);
+                if (attempt < 2) {
+                    try {
+                        Thread.sleep(3_000L * (attempt + 1));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Blomp Swift request was interrupted", ie);
+                    }
+                    continue; // transient connect failure — retry
+                }
+                throw new IOException("Blomp Swift request could not connect: " + e.getMessage(), e);
+            } catch (IOException e) {
+                // dropped/reset connections and similar transport hiccups are
+                // retryable; PUT is idempotent, GET/DELETE are read-only
+                if (attempt < 2) {
+                    try {
+                        Thread.sleep(2_000L * (attempt + 1));
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException("Blomp Swift request was interrupted", ie);
+                    }
+                    continue;
+                }
+                throw new IOException("Blomp Swift request failed: " + e.getMessage(), e);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
                 throw new IOException("Blomp Swift request was interrupted", e);
             }
-            if (response.statusCode() != 401 || attempt == 1) {
-                return response;
-            }
-            synchronized (this) {
-                if (session == current) {
-                    session = null;
+            if (response.statusCode() == 401) {
+                // brief cool-down before re-auth — bursty requests trigger a
+                // short account-level denial window on Blomp
+                try {
+                    Thread.sleep(15_000L * (attempt + 1));
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Blomp Swift request was interrupted", ie);
                 }
+                synchronized (this) {
+                    if (session == current) {
+                        session = null;
+                    }
+                }
+                continue; // token expired or denied — re-auth and retry
             }
+            // Swift answers 502/503/504 when the cluster is busy; retry patiently
+            if (response.statusCode() >= 500 && attempt < 2) {
+                try {
+                    Thread.sleep(4_000L * (attempt + 1));
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("Blomp Swift request was interrupted", e);
+                }
+                continue;
+            }
+            return response;
         }
         throw new IOException("Blomp Swift authorization failed");
     }
@@ -323,24 +486,98 @@ final class BlompSwiftStore implements AutoCloseable {
             if (session != null) {
                 return session;
             }
-            String passwordClean = password;
             try {
-                try {
-                    session = keystoneV3(passwordClean);
-                } catch (IOException primaryFailure) {
-                    // the v2.0 method with the "storage" tenant is the fallback Blomp documents
-                    try {
-                        session = keystoneV2(passwordClean);
-                    } catch (IOException ignored) {
-                        throw new IOException(primaryFailure.getMessage()
-                                + " (v2 fallback also failed: " + ignored.getMessage() + ")", primaryFailure);
-                    }
-                }
+                session = authenticate();
             } catch (IllegalStateException malformed) {
                 throw new IOException(malformed.getMessage(), malformed);
             }
+            session = new Session(connectableUri(session.storageUrl()), session.token());
             return session;
         }
+    }
+
+    /**
+     * Tries the auth endpoints in the order that survives Blomp's network:
+     * plain http first (Blomp's own storage API is http-only, and it keeps
+     * the reachable-IP pinning honest since TLS certs do not cover IPs),
+     * then https, for both Keystone v3 and the documented v2.0 fallback.
+     */
+    private Session authenticate() throws IOException {
+        IOException lastFailure = null;
+        boolean baseIsHttp = authUrl.getScheme().equals("http");
+        String[] attempts = baseIsHttp
+                ? new String[]{"http|v3", "http|v2"}
+                : new String[]{"http|v3", "https|v3", "http|v2", "https|v2"};
+        for (String attempt : attempts) {
+            String scheme = attempt.split("\\|")[0];
+            String version = attempt.split("\\|")[1];
+            int port = authUrl.getPort();
+            String portPart = port == -1
+                    || (scheme.equals("http") && port == 80)
+                    || (scheme.equals("https") && port == 443) ? "" : ":" + port;
+            String endpoint = scheme + "://" + authUrl.getHost() + portPart
+                    + (version.equals("v3") ? "/v3/auth/tokens" : "/v2.0/tokens");
+            try {
+                if (version.equals("v3")) {
+                    return keystoneV3(URI.create(endpoint));
+                }
+                return keystoneV2(URI.create(endpoint));
+            } catch (IOException failure) {
+                lastFailure = failure;
+            }
+        }
+        throw new IOException("could not authenticate against Blomp with any method "
+                + "(http/https, v3/v2): " + (lastFailure == null ? "unknown" : lastFailure.getMessage()),
+                lastFailure);
+    }
+
+    /**
+     * Blomp's hostnames resolve to several IPs and not all of them accept
+     * connections; Java's HttpClient only dials the first resolved address
+     * and dies with ConnectException (curl and Go fail over, Java does not).
+     * Probe each resolved IPv4 with a 3s connect, pin the first reachable one
+     * in a cache, and drop the pin whenever a request fails so the next
+     * attempt re-resolves.
+     */
+    private URI connectableUri(URI uri) {
+        String key = uri.getHost();
+        String cachedAddress = pinnedAddressesByHost.get(key);
+        if (cachedAddress != null) {
+            return withAddress(uri, cachedAddress);
+        }
+        String chosenAddress = null;
+        try {
+            int port = uri.getPort() == -1 ? ("https".equals(uri.getScheme()) ? 443 : 80) : uri.getPort();
+            for (java.net.InetAddress address : java.net.InetAddress.getAllByName(uri.getHost())) {
+                try (java.net.Socket probe = new java.net.Socket()) {
+                    probe.connect(new java.net.InetSocketAddress(address, port), 3000);
+                    chosenAddress = address.getHostAddress();
+                    break;
+                } catch (IOException probeFailure) {
+                    // dead node — try the next resolved address
+                }
+            }
+        } catch (IOException | SecurityException ignored) {
+            // resolution failed entirely; fall back to the original URI
+        }
+        if (chosenAddress == null) {
+            chosenAddress = uri.getHost(); // keep DNS resolution as it is
+        }
+        pinnedAddressesByHost.put(key, chosenAddress);
+        return withAddress(uri, chosenAddress);
+    }
+
+    /** Rebuilds the URI with the given address in place of the hostname. */
+    private static URI withAddress(URI uri, String address) {
+        if (uri.getHost().equals(address)) {
+            return uri;
+        }
+        return URI.create(uri.toString().replaceFirst(java.util.regex.Pattern.quote(uri.getHost()),
+                java.util.regex.Matcher.quoteReplacement(address)));
+    }
+
+    private void dropPin(URI uri) {
+        pinnedAddressesByHost.remove(uri.getHost());
     }
 
     /**
@@ -348,7 +585,7 @@ final class BlompSwiftStore implements AutoCloseable {
      * from the X-Subject-Token header, the storage URL from the "swift" catalog
      * entry picked from the token body.
      */
-    private Session keystoneV3(String passwordClean) throws IOException {
+    private Session keystoneV3(URI endpoint) throws IOException {
         JsonObject identity = new JsonObject();
         com.google.gson.JsonArray methods = new com.google.gson.JsonArray();
         methods.add("password");
@@ -358,7 +595,7 @@ final class BlompSwiftStore implements AutoCloseable {
         JsonObject domain = new JsonObject();
         domain.addProperty("name", "Default");
         user.add("domain", domain);
-        user.addProperty("password", passwordClean);
+        user.addProperty("password", password);
         JsonObject passwordObj = new JsonObject();
         passwordObj.add("user", user);
         identity.add("password", passwordObj);
@@ -366,7 +603,7 @@ final class BlompSwiftStore implements AutoCloseable {
         auth.add("identity", identity);
         JsonObject envelope = new JsonObject();
         envelope.add("auth", auth);
-        HttpRequest request = HttpRequest.newBuilder(URI.create(authUrl + "/v3/auth/tokens"))
+        HttpRequest request = HttpRequest.newBuilder(connectableUri(endpoint))
                 .timeout(java.time.Duration.ofSeconds(30))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(envelope.toString()))
@@ -385,16 +622,16 @@ final class BlompSwiftStore implements AutoCloseable {
     }
 
     /** Keystone v2.0 fallback: passwordCredentials + tenantName "storage" (Blomp's documented rclone way). */
-    private Session keystoneV2(String passwordClean) throws IOException {
+    private Session keystoneV2(URI endpoint) throws IOException {
         JsonObject credentials = new JsonObject();
         credentials.addProperty("username", username);
-        credentials.addProperty("password", passwordClean);
+        credentials.addProperty("password", password);
         JsonObject passwordCredentials = new JsonObject();
         passwordCredentials.add("passwordCredentials", credentials);
         passwordCredentials.addProperty("tenantName", "storage");
         JsonObject auth = new JsonObject();
         auth.add("auth", passwordCredentials);
-        HttpRequest request = HttpRequest.newBuilder(URI.create(authUrl + "/v2.0/tokens"))
+        HttpRequest request = HttpRequest.newBuilder(connectableUri(endpoint))
                 .timeout(java.time.Duration.ofSeconds(30))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(auth.toString()))
@@ -554,7 +791,10 @@ final class BlompSwiftStore implements AutoCloseable {
     }
 
     private static String encode(String value) {
-        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20");
+        // keep '@' raw: Blomp's account container is the account email, and
+        // the proxy treats %40 as a different (forbidden) container name
+        return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20")
+                .replace("%40", "@");
     }
 
     private static String encodePath(String value) {
