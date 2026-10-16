@@ -92,9 +92,10 @@ final class S3BackupStore implements AutoCloseable {
     private final String bucket;
     private final boolean fileLuMode;
     private final FileLuTrashPurger trashPurger;
+    private final java.util.function.Consumer<String> warning;
 
     S3BackupStore(String endpoint, String region, boolean pathStyle, String bucket, String accessKey, String secretKey,
-                  boolean fileLuMode, FileLuTrashPurger trashPurger) {
+                  boolean fileLuMode, FileLuTrashPurger trashPurger, java.util.function.Consumer<String> warning) {
         S3ClientBuilder builder = S3Client.builder()
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)))
@@ -107,6 +108,7 @@ final class S3BackupStore implements AutoCloseable {
         this.bucket = bucket;
         this.fileLuMode = fileLuMode;
         this.trashPurger = trashPurger;
+        this.warning = warning;
     }
 
     void rotate(Path archive, long size) throws IOException {
@@ -135,17 +137,23 @@ final class S3BackupStore implements AutoCloseable {
 
         Path previous = archive.resolveSibling("previous.zip");
         try {
-            if (objectExists(CURRENT_KEY)) {
-                if (fileLuMode) {
-                    download(CURRENT_KEY, previous);
-                } else {
-                    s3.copyObject(CopyObjectRequest.builder()
-                            .bucket(bucket)
-                            .copySource(bucket + "/" + CURRENT_KEY)
-                            .destinationBucket(bucket)
-                            .destinationKey(OLD_KEY)
-                            .build());
+            if (fileLuMode) {
+                // In s5 mode skip the existence check entirely — FileLu's HEAD
+                // is the stalest thing in the ecosystem (it both lies "exists"
+                // and lies "missing"). Just GET directly and accept that the
+                // read may need patience; sharing what's really there wins
+                // over trusting metadata.
+                if (!downloadPrevious(previous)) {
+                    warning.accept("could not read the previous backup back (a 404 persisted) — "
+                            + "continuing with the new backup only; old.zip will be missing this round");
                 }
+            } else if (objectExists(CURRENT_KEY)) {
+                s3.copyObject(CopyObjectRequest.builder()
+                        .bucket(bucket)
+                        .copySource(bucket + "/" + CURRENT_KEY)
+                        .destinationBucket(bucket)
+                        .destinationKey(OLD_KEY)
+                        .build());
             }
             upload(CURRENT_KEY, archive);
             verifyUpload(CURRENT_KEY, archive, size, previousCurrentSize);
@@ -358,6 +366,40 @@ final class S3BackupStore implements AutoCloseable {
         try (var object = s3.getObject(GetObjectRequest.builder().bucket(bucket).key(key).build())) {
             Files.copy(object, destination, StandardCopyOption.REPLACE_EXISTING);
         }
+    }
+
+    /**
+     * Downloads the previous current.zip, tolerating FileLu's gateway 404ing
+     * for a while after an overwrite (the same eventually-consistent behavior
+     * that keeps HEAD stale). Waits up to ~2.5 minutes total before accepting
+     * that the object really cannot be read this round.
+     */
+    private boolean downloadPrevious(Path destination) throws IOException {
+        long[] waitsMillis = {10_000L, 15_000L, 20_000L, 30_000L, 30_000L, 40_000L};
+        for (int attempt = 1; attempt <= waitsMillis.length + 1; attempt++) {
+            try {
+                download(CURRENT_KEY, destination);
+                if (attempt > 1) {
+                    warning.accept("previous backup became readable again after " + attempt
+                            + " tries — old.zip this round is preserved");
+                }
+                return true;
+            } catch (software.amazon.awssdk.services.s3.model.S3Exception e) {
+                if (e.statusCode() != 404) {
+                    throw new IOException("could not download the previous backup: "
+                            + e.getMessage(), e);
+                }
+                if (attempt <= waitsMillis.length) {
+                    try {
+                        Thread.sleep(waitsMillis[attempt - 1]);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        return false;
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     private HeadObjectResponse head(String key) {

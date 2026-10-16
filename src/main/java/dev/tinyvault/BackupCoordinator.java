@@ -112,7 +112,7 @@ final class BackupCoordinator {
         BackupState state = new BackupState(plugin.getDataFolder().toPath().resolve("state.txt"));
         state.load();
         S3BackupStore store = new S3BackupStore(endpoint, region, pathStyle, bucket, accessKey, secretKey,
-                fileLuMode, trashPurger);
+                fileLuMode, trashPurger, plugin.getLogger()::warning);
         ServerArchiver archiver = new ServerArchiver(serverRoot(plugin), plugin.getDataFolder().toPath());
         return new BackupCoordinator(plugin, store, archiver, state, backupInterval, fileLuMode, extreme,
                 minSession, webhook);

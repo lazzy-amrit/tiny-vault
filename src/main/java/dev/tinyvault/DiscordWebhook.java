@@ -34,9 +34,36 @@ final class DiscordWebhook {
                 return thread;
             });
 
-    DiscordWebhook(String url, Consumer<String> warning) {
-        this.url = (url == null || url.isBlank()) ? null : url.strip();
+    DiscordWebhook(String rawUrl, Consumer<String> warning) {
         this.warning = warning;
+        String cleaned = sanitizeWebhookUrl(rawUrl);
+        if (!cleaned.isBlank() && !cleaned.startsWith("https://discord.com/api/webhooks/")
+                && !cleaned.startsWith("https://discordapp.com/api/webhooks/")) {
+            warning.accept("webhook-url does not look like a Discord webhook (expected "
+                    + "https://discord.com/api/webhooks/...) — announcements stay disabled until it is fixed");
+        }
+        this.url = cleaned.isBlank() ? null : cleaned;
+    }
+
+    /**
+     * Config values often arrive wrapped in quotes when pasted from chat ("…"),
+     * copied between fences, or written with trailing whitespace. Strip all of
+     * that; anything that is not clearly a webhook URL is rejected instead of
+     * being POSTed to Discord (which would answer 400).
+     */
+    private static String sanitizeWebhookUrl(String raw) {
+        if (raw == null) {
+            return "";
+        }
+        String out = raw.strip();
+        out = out.replace("```", "").replace("**", "").strip();
+        while (out.length() > 0 && "\"'`,; ".indexOf(out.charAt(0)) >= 0) {
+            out = out.substring(1);
+        }
+        while (out.length() > 0 && "\"'`,; ".indexOf(out.charAt(out.length() - 1)) >= 0) {
+            out = out.substring(0, out.length() - 1);
+        }
+        return out;
     }
 
     /**
@@ -71,25 +98,52 @@ final class DiscordWebhook {
 
     private String embed(int color, String title, String description, Instant timestamp,
                          String[][] fields) {
+        // Discord rejects sub-millisecond-precision ISO timestamps with 400.
+        String cleanTimestamp = timestamp.truncatedTo(java.time.temporal.ChronoUnit.MILLIS).toString();
         StringBuilder out = new StringBuilder();
         out.append("{\"username\":\"TinyVault\",\"embeds\":[{\"title\":\"")
-                .append(jsonEscape(title)).append('"');
+                .append(jsonEscape(fieldText(title, 256))).append('"');
         if (description != null && !description.isBlank()) {
-            out.append(",\"description\":\"").append(jsonEscape("*" + description + "*")).append('"');
+            out.append(",\"description\":\"")
+                    .append(jsonEscape("*" + fieldText(description, 2048) + "*")).append('"');
         }
         out.append(",\"color\":").append(color);
-        out.append(",\"timestamp\":\"").append(timestamp).append('"');
+        out.append(",\"timestamp\":\"").append(cleanTimestamp).append('"');
         out.append(",\"fields\":[");
         for (int i = 0; i < fields.length; i++) {
             if (i > 0) {
                 out.append(',');
             }
-            out.append("{\"name\":\"").append(jsonEscape(fields[i][0]))
-                    .append("\",\"value\":\"").append(jsonEscape(fields[i][1]))
+            out.append("{\"name\":\"").append(jsonEscape(fieldText(fields[i][0], 256)))
+                    .append("\",\"value\":\"").append(jsonEscape(fieldText(fields[i][1], 1024)))
                     .append("\",\"inline\":true}");
         }
-        out.append("}]}");
+        // closes: fields array, embed object, embeds array, root object —
+        // the field's own } came from the loop above
+        out.append(']');
+        out.append('}');
+        out.append(']');
+        out.append('}');
         return out.toString();
+    }
+
+    /**
+     * Discord rejects empty or over-limit embed strings with 400: names cap
+     * at 256, values at 1024, descriptions at 2048. Empty values get a
+     * placeholder so nothing can slip through as "".
+     */
+    private static String fieldText(String in, int limit) {
+        if (in == null) {
+            return "n/a";
+        }
+        String out = in.strip();
+        if (out.isEmpty()) {
+            return "n/a";
+        }
+        if (out.length() > limit) {
+            out = out.substring(0, limit - 1) + "…";
+        }
+        return out;
     }
 
     private void post(String payload) {
@@ -121,7 +175,12 @@ final class DiscordWebhook {
                         Thread.sleep((long) (seconds * 1000.0));
                         continue;
                     }
-                    warning.accept("Discord webhook replied HTTP " + response.statusCode());
+                    String body = response.body() == null ? "" : response.body().strip();
+                    if (body.length() > 300) {
+                        body = body.substring(0, 300) + "…";
+                    }
+                    warning.accept("Discord webhook replied HTTP " + response.statusCode()
+                            + (body.isEmpty() ? "" : ": " + body));
                     return;
                 } catch (InterruptedException e) {
                     Thread.currentThread().interrupt();
