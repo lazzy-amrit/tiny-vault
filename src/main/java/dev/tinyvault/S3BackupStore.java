@@ -38,11 +38,14 @@ import java.nio.file.StandardCopyOption;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
+import java.time.ZoneId;
+import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.function.Consumer;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
@@ -73,11 +76,9 @@ import java.util.concurrent.Executors;
  */
 final class S3BackupStore implements AutoCloseable {
     static final String PREFIX = "backups/";
-    /** FileLu slot keys are unique per run: no overwrites, no re-creates. */
-    static final String SLOT_PREFIX = PREFIX + "backup-";
     private static final String LEGACY_TEMP_KEY = PREFIX + "uploading.zip";
-    private static final String LEGACY_CURRENT = PREFIX + "current.zip";
-    private static final String LEGACY_OLD = PREFIX + "old.zip";
+    private static final String CURRENT_KEY = PREFIX + "current.zip";
+    private static final String OLD_KEY = PREFIX + "old.zip";
     private static final long PART_SIZE = 64L * 1024 * 1024;
     private static final int MAX_PARALLEL_PARTS = 3;
     /** Bytes of the stored object read back directly to bypass stale HEAD metadata. */
@@ -97,10 +98,10 @@ final class S3BackupStore implements AutoCloseable {
     private final String bucket;
     private final boolean fileLuMode;
     private final FileLuTrashPurger trashPurger;
-    private final java.util.function.Consumer<String> warning;
+    private final Consumer<String> warning;
 
     S3BackupStore(String endpoint, String region, boolean pathStyle, String bucket, String accessKey, String secretKey,
-                  boolean fileLuMode, FileLuTrashPurger trashPurger, java.util.function.Consumer<String> warning) {
+                  boolean fileLuMode, FileLuTrashPurger trashPurger, Consumer<String> warning) {
         S3ClientBuilder builder = S3Client.builder()
                 .region(Region.of(region))
                 .credentialsProvider(StaticCredentialsProvider.create(AwsBasicCredentials.create(accessKey, secretKey)))
@@ -117,203 +118,151 @@ final class S3BackupStore implements AutoCloseable {
     }
 
     /**
-     * Stores the new archive as the newest backup slot and keeps exactly two.
+     * Stores the new archive as the newest backup and keeps exactly two,
+     * named literally {@code backups/current.zip} and {@code backups/old.zip}.
      * Returns the key the archive was stored under.
      *
-     * FileLu s5 mode uses <b>unique human-readable slot keys</b>
-     * ({@code backups/backup-2026-10-16_18.44.zip}). Verified live against
-     * the real gateway: overwriting an existing key breaks the object
-     * (HEAD/list keep showing it, GET later returns 404), and re-creating a
-     * deleted key has the same ghost shape. Create-once uploads proved
-     * reliable, so every run gets its own key and exactly two newest slots
-     * are kept. Space is freed BEFORE each upload (the one-but-newest slot
-     * and all legacy junk leave first), so quota never blocks a backup; the
-     * only readable backup is never removed before a fresh verified one
-     * exists.
-     *
-     * Standard S3 mode keeps the classic current.zip/old.zip names with
-     * server-side CopyObject, since real S3 handles overwrite and copy.
+     * FileLu s5 flow — live-tested against the real gateway, which proved:
+     * overwriting a key is reliable and serves fresh content; deleting a key
+     * and re-creating it as multipart ghosts (object visible, GET 404).
+     * So the names are NEVER deleted — both are overwritten in place:
+     * <ol>
+     * <li>purge FileLu trash (needs `api-key`), cleaning anything older
+     *     versions left behind;</li>
+     * <li>download current.zip to a local safety copy — that copy IS the
+     *     "rename" source and stays on disk as disaster recovery;</li>
+     * <li>the safety copy is OVERWRITTEN onto old.zip (old current becomes
+     *     old) and verified by reading it back;</li>
+     * <li>the new archive is OVERWRITTEN onto current.zip and verified the
+     *     same way — this one failing fails the run;</li>
+     * <li>final trash purge; since nothing is deleted, trash stays empty.
+     * </ol>
+     * If old.zip cannot be verified after retries the run still succeeds —
+     * current.zip is the critical slot and a warning is logged instead.
      */
     String rotate(Path archive, long size, Instant startedAt) throws IOException {
         deleteIfPresent(LEGACY_TEMP_KEY);
         abortStaleUploads();
         if (!fileLuMode) {
-            deleteIfPresent(LEGACY_OLD);
-            if (objectExists(LEGACY_CURRENT)) {
+            deleteIfPresent(OLD_KEY);
+            if (objectExists(CURRENT_KEY)) {
                 s3.copyObject(CopyObjectRequest.builder()
                         .bucket(bucket)
-                        .copySource(bucket + "/" + LEGACY_CURRENT)
+                        .copySource(bucket + "/" + CURRENT_KEY)
                         .destinationBucket(bucket)
-                        .destinationKey(LEGACY_OLD)
+                        .destinationKey(OLD_KEY)
                         .build());
             }
-            upload(LEGACY_CURRENT, archive);
-            verifyUpload(LEGACY_CURRENT, archive, size, -1);
-            return LEGACY_CURRENT;
+            upload(CURRENT_KEY, archive);
+            verifyUpload(CURRENT_KEY, archive, size, -1);
+            return CURRENT_KEY;
         }
 
         if (!trashPurger.enabled()) {
             warning.accept("api-key is empty in config.yml — FileLu trash cannot be purged automatically; "
-                    + "deleted backups stay in trash consuming quota until emptied in the web UI "
+                    + "old trash entries keep consuming quota until emptied in the web UI "
                     + "(My Account -> API Key on filelu.com, NOT the S5 keys)");
         }
         trashPurger.purgeBackupNames();
 
-        List<String> era = new ArrayList<>();
-        List<String> junk = new ArrayList<>();
-        for (String key : listAllUnder(PREFIX)) {
-            if (key.equals(LEGACY_TEMP_KEY)) {
-                continue;
-            }
-            if (key.startsWith(SLOT_PREFIX)) {
-                era.add(key);
-            } else {
-                junk.add(key);
-            }
-        }
-        era.sort(Comparator.reverseOrder());
+        // local safety copy of the previous backup = the "rename" source
+        Path previous = archive.resolveSibling("previous.zip");
+        boolean havePrevious = refreshPrevious(previous);
 
-        // make room before uploading: keep only the newest slot; everything
-        // else goes once at least one verified slot exists
-        List<String> victims = new ArrayList<>();
-        for (int i = 1; i < era.size(); i++) {
-            victims.add(era.get(i));
-        }
-        if (!era.isEmpty()) {
-            victims.addAll(junk);
-        } else {
-            // no verified slots yet: keep the possibly-still-readable legacy
-            // current.zip until the new upload is verified; ghosts can go
-            for (String candidate : junk) {
-                if (!candidate.equals(LEGACY_CURRENT)) {
-                    victims.add(candidate);
-                }
-            }
-        }
-        deleteQuietly(victims);
-        if (!victims.isEmpty()) {
-            trashPurger.purgeBackupNames();
+        if (havePrevious) {
+            long previousSize = Files.size(previous);
+            upload(OLD_KEY, previous); // overwrite the name; never delete it
+            verifySlot(OLD_KEY, previous, previousSize, true);
+        } else if (!objectExists(OLD_KEY)) {
+            warning.accept("no previous backup to place as old.zip yet — it fills from the next run on");
         }
 
-        String newKey = freshSlotKey(startedAt);
-        upload(newKey, archive);
-        verifyUpload(newKey, archive, size, -1);
+        upload(CURRENT_KEY, archive); // the new backup becomes current
+        verifySlot(CURRENT_KEY, archive, size, false);
 
-        if (era.isEmpty()) {
-            // a verified slot now exists; the readable legacy copy may go
-            deleteQuietly(List.of(LEGACY_CURRENT));
-            trashPurger.purgeBackupNames();
+        trashPurger.purgeBackupNames(); // nothing should be in there; sweep anyway
+        return CURRENT_KEY;
+    }
+
+    /** Downloads current.zip to the local safety copy; keeps an older copy when the read fails. */
+    private boolean refreshPrevious(Path previous) {
+        try {
+            download(CURRENT_KEY, previous);
+            return true;
+        } catch (Exception e) {
+            if (Files.exists(previous)) {
+                warning.accept("current.zip could not be read back; reusing the local copy from the last "
+                        + "successful run as old.zip");
+                return true;
+            }
+            return false;
         }
-        return newKey;
     }
 
     /**
-     * Human-readable unique slot key: backup-2026-10-16_18.44.zip; two runs
-     * inside the same minute get _2, _3… suffixes (those still sort after).
+     * Verifies an overwritten slot by content, never trusting FileLu's
+     * metadata alone. PASS when either the first 4 KiB of a plain GET match
+     * the local file exactly, or HEAD reports the expected size and the
+     * object is readable as a zip. Waits through the gateway's propagation
+     * window before giving up.
      */
-    private String freshSlotKey(Instant startedAt) throws IOException {
-        DateTimeFormatter stamp = DateTimeFormatter.ofPattern("yyyy-MM-dd_HH.mm").withZone(slotZone);
-        String base = SLOT_PREFIX + stamp.format(startedAt) + ".zip";
-        String key = base;
-        int bump = 2;
-        try {
-            while (objectExists(key)) {
-                key = SLOT_PREFIX + stamp.format(startedAt) + "_" + bump + ".zip";
-                bump++;
-            }
-        } catch (Exception e) {
-            // if probing fails fall back to a guaranteed-unique name
-            return SLOT_PREFIX + stamp.format(startedAt) + "_" + startedAt.toEpochMilli() + ".zip";
+    private void verifySlot(String key, Path file, long size, boolean degradedTolerant) throws IOException {
+        byte[] localHead = new byte[0];
+        try (InputStream in = Files.newInputStream(file)) {
+            localHead = in.readNBytes(4096);
         }
-        return key;
-    }
-
-    /** All keys under the prefix; empty on listing trouble. */
-    private List<String> listAllUnder(String prefix) {
-        List<String> keys = new ArrayList<>();
-        try {
-            ListObjectsV2Response list = s3.listObjectsV2(
-                    ListObjectsV2Request.builder().bucket(bucket).prefix(prefix).build());
-            list.contents().forEach(o -> keys.add(o.key()));
-            while (list.isTruncated()) {
-                list = s3.listObjectsV2(ListObjectsV2Request.builder()
-                        .bucket(bucket)
-                        .prefix(prefix)
-                        .continuationToken(list.nextContinuationToken())
-                        .build());
-                list.contents().forEach(o -> keys.add(o.key()));
-            }
-        } catch (Exception e) {
-            warning.accept("could not list bucket objects (" + e.getMessage() + "); skipping cleanup this run");
-            return List.of();
-        }
-        return keys;
-    }
-
-    private void deleteQuietly(List<String> keys) {
-        for (String key : keys) {
+        IOException failure = null;
+        long[] waits = {20_000L, 30_000L, 45_000L, 60_000L, 90_000L, 90_000L, 120_000L, 120_000L, 180_000L, 180_000L};
+        for (int attempt = 0; attempt < waits.length; attempt++) {
             try {
-                s3.deleteObject(DeleteObjectRequest.builder().bucket(bucket).key(key).build());
-            } catch (Exception e) {
-                warning.accept("could not delete " + key + ": " + e.getMessage());
+                byte[] remoteHead = new byte[0];
+                try (InputStream object = s3.getObject(GetObjectRequest.builder()
+                        .bucket(bucket).key(key).build())) {
+                    remoteHead = object.readNBytes(4096);
+                }
+                if (remoteHead.length > 0 && startsWith(remoteHead, localHead)) {
+                    return; // exact content is being served
+                }
+                if (head(key).contentLength() == size && remoteHead.length >= 2
+                        && remoteHead[0] == 'P' && remoteHead[1] == 'K') {
+                    return; // right size, readable zip — propagation caught up
+                }
+                failure = new IOException(key + ": content not yet serving the new upload");
+            } catch (NoSuchKeyException e) {
+                failure = new IOException(key + ": not readable after upload (propagation)");
             }
-        }
-        if (!keys.isEmpty()) {
             try {
-                deleteIfPresent(LEGACY_TEMP_KEY);
-            } catch (Exception ignored) {
-                // best effort
+                Thread.sleep(waits[attempt]);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw failure;
             }
         }
+        if (degradedTolerant) {
+            warning.accept(key + " could not be verified after " + waits.length + " checks — the new "
+                    + "current.zip is safe; old.zip will be retried next run");
+            return;
+        }
+        throw failure;
     }
 
-    /** All slot keys newest-first. On listing trouble: empty list, no deletes this run. */
-    private List<String> listSlots(String guaranteedNewest) {
-        List<String> keys = new ArrayList<>();
-        try {
-            ListObjectsV2Response list = s3.listObjectsV2(
-                    ListObjectsV2Request.builder().bucket(bucket).prefix(SLOT_PREFIX).build());
-            list.contents().forEach(o -> keys.add(o.key()));
-            while (list.isTruncated()) {
-                list = s3.listObjectsV2(ListObjectsV2Request.builder()
-                        .bucket(bucket)
-                        .prefix(SLOT_PREFIX)
-                        .continuationToken(list.nextContinuationToken())
-                        .build());
-                list.contents().forEach(o -> keys.add(o.key()));
+    private static boolean startsWith(byte[] value, byte[] prefix) {
+        if (value.length < prefix.length) {
+            return false;
+        }
+        for (int i = 0; i < prefix.length; i++) {
+            if (value[i] != prefix[i]) {
+                return false;
             }
-        } catch (Exception e) {
-            warning.accept("could not list existing backup slots (" + e.getMessage()
-                    + "); skipping slot cleanup this run");
-            return List.of();
         }
-        if (!keys.contains(guaranteedNewest)) {
-            keys.add(guaranteedNewest);
-        }
-        keys.sort(Comparator.reverseOrder());
-        return keys;
+        return true;
     }
 
-    /** The kept backup slots, newest first, for /vault detail; size null when unreadable-now. */
+    /** The two backup slots, newest first, for /vault detail; size null when absent. */
     Map<String, Long> slots() {
         Map<String, Long> out = new LinkedHashMap<>();
-        if (!fileLuMode) {
-            for (String key : new String[]{CURRENT_KEY, OLD_KEY}) {
-                out.put(key, headSizeOrNull(key));
-            }
-            return out;
-        }
-        try {
-            List<String> keys = new ArrayList<>();
-            ListObjectsV2Response list = s3.listObjectsV2(
-                    ListObjectsV2Request.builder().bucket(bucket).prefix(SLOT_PREFIX).build());
-            list.contents().forEach(o -> keys.add(o.key()));
-            keys.sort(Comparator.reverseOrder());
-            for (String key : keys.subList(0, Math.min(2, keys.size()))) {
-                out.put(key, headSizeOrNull(key));
-            }
-        } catch (Exception ignored) {
-            // the detail view is best-effort
+        for (String key : new String[]{CURRENT_KEY, OLD_KEY}) {
+            out.put(key, headSizeOrNull(key));
         }
         return out;
     }

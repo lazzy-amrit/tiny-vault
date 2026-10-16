@@ -72,8 +72,9 @@ final class FileLuTrashPurger {
         if (BACKUP_NAMES.contains(bare)) {
             return true;
         }
-        // the timestamped slot keys of the current version
-        return bare.matches("tv-\\d+\\.zip");
+        // timestamped slot keys of both older and current versions
+        return bare.matches("tv-\\d+\\.zip")
+                || bare.matches("backup-\\d{4}-\\d{2}-\\d{2}_.+\\.zip");
     }
 
     private void purge(String fileCode, String name) {

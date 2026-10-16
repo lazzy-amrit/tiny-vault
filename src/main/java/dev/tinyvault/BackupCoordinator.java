@@ -10,6 +10,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
+import java.time.ZoneId;
 import java.util.Locale;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -297,14 +298,14 @@ final class BackupCoordinator {
             }
 
             phase = Phase.UPLOADING;
-            store.rotate(archive, Files.size(archive), startedAt);
+            String storedKey = store.rotate(archive, Files.size(archive), startedAt);
             state.recordSuccess(startedAt);
             long archiveSize = Files.size(archive);
             plugin.getLogger().info(String.format(
-                    "Backup completed in %ds (%.1f MiB) — newest backup is %stv-%d.zip",
+                    "Backup completed in %ds (%.1f MiB) — stored as %s",
                     Duration.between(startedAt, Instant.now()).toSeconds(),
                     archiveSize / 1024.0 / 1024.0,
-                    S3BackupStore.PREFIX, startedAt.toEpochMilli()));
+                    storedKey));
             String nextText = extreme
                     ? "at the next shutdown"
                     : "in " + formatInterval(backupInterval);

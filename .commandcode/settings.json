@@ -9,7 +9,10 @@
       "Shell(gradle:*)",
       "Shell(grep:*)",
       "Shell(ls:*)",
-      "Shell(for i in $(seq 1 30); do code=$(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:9000/ 2>/dev/null); if [ \"$code\" != \"000\" ]; then echo \"s3 up\"; break; fi; sleep 1; done; python3 -m venv /tmp/s3test 2>/dev/null; /tmp/s3test/bin/pip install --quiet --disable-pip-version-check boto3 2>/dev/null; /tmp/s3test/bin/python - <<'EOF' import boto3 from botocore.client import Config s3 = boto3.client(\"s3\", endpoint_url=\"http://127.0.0.1:9000\", aws_access_key_id=\"testkey\", aws_secret_access_key=\"testsecret\", region_name=\"us-east-1\", config=Config(s3={\"addressing_style\": \"path\"})) s3.create_bucket(Bucket=\"mcbackups\") print(\"bucket ready\") EOF)"
+      "Shell(for i in $(seq 1 30); do code=$(curl -s -o /dev/null -w \"%{http_code}\" http://127.0.0.1:9000/ 2>/dev/null); if [ \"$code\" != \"000\" ]; then echo \"s3 up\"; break; fi; sleep 1; done; python3 -m venv /tmp/s3test 2>/dev/null; /tmp/s3test/bin/pip install --quiet --disable-pip-version-check boto3 2>/dev/null; /tmp/s3test/bin/python - <<'EOF' import boto3 from botocore.client import Config s3 = boto3.client(\"s3\", endpoint_url=\"http://127.0.0.1:9000\", aws_access_key_id=\"testkey\", aws_secret_access_key=\"testsecret\", region_name=\"us-east-1\", config=Config(s3={\"addressing_style\": \"path\"})) s3.create_bucket(Bucket=\"mcbackups\") print(\"bucket ready\") EOF)",
+      "Shell(/bin/javac:*)",
+      "Shell(/bin/java:*)",
+      "Shell(sed:*)"
     ],
     "deny": [],
     "defaultMode": "default"

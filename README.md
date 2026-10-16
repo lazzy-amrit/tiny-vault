@@ -10,9 +10,8 @@
 Minimal Paper plugin that backs up the entire server directory to FileLu S5
 (S3-compatible) object storage and keeps exactly two remote ZIP archives:
 
-- `backups/tv-<timestamp>.zip` — exactly the two newest are kept. The
-  newest slot *is* the "current.zip" of this design (latest successful
-  backup); the slot behind it is the "old.zip" (previous successful backup).
+- `backups/current.zip` — latest successful backup
+- `backups/old.zip` — previous successful backup
 
 Backups run on a `timer` interval you set yourself — `24h` (default), `4h`,
 or minutes like `15m` (`m` = minutes, `h` = hours; a plain unsuffixed number
@@ -109,23 +108,25 @@ Notes:
   is paused while the archive is written and restored afterwards), then the
   whole server directory — excluding TinyVault's own folder, which holds the
   state file, config and temp archives — is streamed into one ZIP.
-- Two slots are kept, but on FileLu they are **not named `current.zip` /
-  `old.zip`** — and that is deliberate. Verified live against FileLu's real
-  S5 gateway: overwriting an existing key breaks the object (HEAD and the
-  folder listing keep showing it, but the next GET returns 404), and so does
-  re-creating a key after a delete. Create-once uploads are the only form
-  that stayed reliable, so every backup lands on its own key
-  (`backups/tv-<millis>.zip`) and the two newest are kept:
-  1. The new archive uploads under a fresh key and is verified by content
-     (ranged tail read; multipart PUTs that fail abort and abort cleanly).
-  2. Only when two verified slots exist, older overflow and any leftover
-     legacy `current.zip`/`old.zip` from older plugin versions are deleted,
-     and their FileLu trash entries are purged (needs `api-key`).
-  So the bucket always holds exactly two healthy, downloadable zips: the
-  newest (your "current") and the one behind it (your "old").
-  There is no remote temp object, nothing lingers in the bucket or trash.
-  Standard S3 (CopyObject-capable providers) still uses the classic fixed
-  `current.zip`/`old.zip` names.
+- Two-slot rotation with the literal names `backups/current.zip` (latest)
+  and `backups/old.zip` (previous). Live testing against FileLu's real S5
+  gateway showed it breaks objects on *overwrite* and on *re-create after
+  delete* (HEAD and the listing keep showing the object, but the next GET
+  returns 404 — a "ghost" that HEAD-only verification happily passed), so
+  the FileLu flow is built defensively:
+  1. The previous `current.zip` is downloaded to a local safety copy kept on
+     disk (never deleted, refreshed every successful run).
+  2. Both remote names are deleted, and FileLu's trash is purged with the
+     account `api-key` — only a purged name can re-bind cleanly on FileLu.
+  3. The new archive uploads as `current.zip` and is verified by READING it
+     back (zip magic bytes via plain GET, not trusting HEAD metadata); a
+     ghost is deleted and re-uploaded, up to three tries.
+  4. The local safety copy uploads as `old.zip`, verified the same way.
+  5. FileLu trash is purged again, leaving nothing behind.
+  If a verify still fails, the run fails BEFORE the final purge, so the
+  trash still holds the deleted backups for recovery — nothing is silently
+  lost. Standard S3 (CopyObject-capable providers) uses the same two names
+  with a server-side copy.
 - Archives larger than 64 MiB are uploaded as S3 multipart (64 MiB parts, up
   to three in parallel) because FileLu's gateway rejects long single-request
   PUTs. Interrupted uploads are aborted immediately, and any leftover
