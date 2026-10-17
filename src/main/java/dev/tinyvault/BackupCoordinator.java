@@ -293,7 +293,8 @@ final class BackupCoordinator {
                     "Backup completed in %ds (%.1f MiB) — stored as %s",
                     Duration.between(startedAt, Instant.now()).toSeconds(),
                     archiveSize / 1024.0 / 1024.0,
-                    storedKey));
+                    // never show the account email in logs/messages
+                    storedKey.substring(storedKey.indexOf('/') + 1)));
             String nextText = extreme
                     ? "at the next shutdown"
                     : "in " + formatInterval(backupInterval);

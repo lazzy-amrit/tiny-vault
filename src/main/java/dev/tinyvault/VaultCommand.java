@@ -225,25 +225,59 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
             public void run() {
                 try {
                     List<BlompSwiftStore.StorageEntry> entries = coordinator.store().listContents();
+
+                    // file-manager style: numbered containers, their files listed
+                    // inside, sized; the account email is never shown
+                    Map<String, List<BlompSwiftStore.StorageEntry>> groups = new java.util.LinkedHashMap<>();
+                    for (BlompSwiftStore.StorageEntry entry : entries) {
+                        if (entry.directory()) {
+                            if (entry.path().indexOf('/') == entry.path().length() - 1) {
+                                groups.putIfAbsent(entry.path(), new java.util.ArrayList<>());
+                            }
+                            continue; // deeper prefix markers are covered by their files
+                        }
+                        int slash = entry.path().indexOf('/');
+                        String group = slash < 0 ? "" : entry.path().substring(0, slash + 1);
+                        groups.computeIfAbsent(group, k -> new java.util.ArrayList<>()).add(entry);
+                    }
+
+                    List<String> lines = new java.util.ArrayList<>();
+                    int containerNumber = 1;
+                    int fileCount = 0;
+                    for (Map.Entry<String, List<BlompSwiftStore.StorageEntry>> group : groups.entrySet()) {
+                        String name = group.getKey().replace("/", "");
+                        String display = name.contains("@") ? name.substring(0, name.indexOf('@'))
+                                + " … (your account)" : name;
+                        List<BlompSwiftStore.StorageEntry> files = group.getValue();
+                        lines.add(containerNumber + ". " + display + "   " + files.size() + " file"
+                                + (files.size() == 1 ? "" : "s"));
+                        containerNumber++;
+                        for (BlompSwiftStore.StorageEntry file : files) {
+                            String inner = file.path().substring(group.getKey().length());
+                            lines.add("     " + inner + "   " + byteText(file.sizeBytes()));
+                            fileCount++;
+                        }
+                    }
+
                     int pageSize = 20;
-                    int pages = Math.max(1, (entries.size() + pageSize - 1) / pageSize);
+                    int pages = Math.max(1, (lines.size() + pageSize - 1) / pageSize);
                     int selectedPage = Math.min(page, pages);
-                    sender.sendMessage(header("blomp files · page " + selectedPage + " of " + pages));
+                    sender.sendMessage(header("blomp file manager · page " + selectedPage + " of " + pages));
                     int from = (selectedPage - 1) * pageSize;
-                    int to = Math.min(entries.size(), from + pageSize);
-                    if (entries.isEmpty()) {
+                    int to = Math.min(lines.size(), from + pageSize);
+                    if (lines.isEmpty()) {
                         sender.sendMessage(plain("empty — nothing is stored yet"));
                     }
                     for (int index = from; index < to; index++) {
-                        BlompSwiftStore.StorageEntry entry = entries.get(index);
-                        sender.sendMessage(plain((entry.directory() ? "▸ " : "  ") + entry.path()
-                                + (entry.directory() ? "" : "   " + byteText(entry.sizeBytes()))));
+                        sender.sendMessage(plain(lines.get(index)));
                     }
                     if (pages > 1) {
                         sender.sendMessage(field("pages:", "/vault files " + Math.max(1, selectedPage - 1)
                                 + "  ·  next: /vault files " + Math.min(pages, selectedPage + 1)));
                     }
-                    sender.sendMessage(entryCountLine(entries));
+                    sender.sendMessage(plain(containerNumber - 1 + " container(s) · " + fileCount
+                            + " total file(s)"));
+                    sender.sendMessage(line());
                 } catch (Exception e) {
                     sender.sendMessage(header("blomp files"));
                     sender.sendMessage(field("status:", "unavailable (" + safeMessage(e) + ")"));
@@ -251,19 +285,6 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
                 }
             }
         }.runTaskAsynchronously(plugin);
-    }
-
-    private String entryCountLine(List<BlompSwiftStore.StorageEntry> entries) {
-        int directories = 0;
-        int files = 0;
-        for (BlompSwiftStore.StorageEntry entry : entries) {
-            if (entry.directory()) {
-                directories++;
-            } else {
-                files++;
-            }
-        }
-        return line() + "  (" + directories + " dirs, " + files + " files)";
     }
 
     private String byteText(Long bytes) {

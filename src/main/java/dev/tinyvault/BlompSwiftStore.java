@@ -409,14 +409,6 @@ final class BlompSwiftStore implements AutoCloseable {
             HttpResponse<byte[]> response;
             try {
                 response = http.send(httpRequest, HttpResponse.BodyHandlers.ofByteArray());
-                if (response.statusCode() >= 400) {
-                    // TEMPORARY diagnostics
-                    System.out.println("[tv-debug] " + method + " " + httpRequest.uri()
-                            + " -> " + response.statusCode()
-                            + " tokenLen=" + current.token().length()
-                            + " body=" + new String(response.body(), StandardCharsets.UTF_8)
-                            .substring(0, Math.min(100, response.body().length)));
-                }
             } catch (HttpConnectTimeoutException e) {
                 dropPin(uri);
                 if (attempt < 2) {
@@ -450,7 +442,7 @@ final class BlompSwiftStore implements AutoCloseable {
                 // brief cool-down before re-auth — bursty requests trigger a
                 // short account-level denial window on Blomp
                 try {
-                    Thread.sleep(15_000L * (attempt + 1));
+                    Thread.sleep(25_000L * (attempt + 1));
                 } catch (InterruptedException ie) {
                     Thread.currentThread().interrupt();
                     throw new IOException("Blomp Swift request was interrupted", ie);
