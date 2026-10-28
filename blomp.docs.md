@@ -184,6 +184,27 @@ cleanup), reports ✅/⚠️/❌ per step, exit codes: 0 good, 1 fail, 2 outage.
 Last verified: 2026-10-16, uploads + rotation + cleanup all green against the
 live account.
 
+## 10.1 TLS-vs-IP pinning bug (found 2026-10-28)
+
+The reachable-IP pin originally applied to BOTH http and https auth attempts.
+Blomp's TLS certificate does not list their bare IPs, so any https attempt with
+a pinned IP died with `certificate_unknown: No subject alternative names
+matching IP address ...` (and when the pinned IP also went dead, all four auth
+paths failed and the run aborted). Fix: pinning is now http-only; https keeps
+the real hostname (TLS verifies it) and relies on the retry chain. Auth
+failures also drop the pin so the next attempt re-probes DNS, and the failure
+detail now lists the reason of EVERY auth path instead of a single cryptic
+"null".
+
+## 10.2 Safer autosave window (same day)
+
+Autosave used to stay disabled for the ENTIRE run (save + archive + upload).
+Since the finished ZIP cannot be affected by later world changes, autosave is
+now restored immediately after the archive is written — the unprotected window
+is only save+archive, never the upload. Paper also saves worlds
+asynchronously, so a ~2.5s settle delay was added between save and archiving
+so the ZIP never captures half-written region files.
+
 ## 10. CONFIRMED WORKING IN PRODUCTION — 2026-10-16 evening
 
 The first real scheduled backup on the live server **completed successfully**

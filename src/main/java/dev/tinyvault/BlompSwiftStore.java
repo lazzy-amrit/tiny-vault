@@ -495,11 +495,11 @@ final class BlompSwiftStore implements AutoCloseable {
      * then https, for both Keystone v3 and the documented v2.0 fallback.
      */
     private Session authenticate() throws IOException {
-        IOException lastFailure = null;
         boolean baseIsHttp = authUrl.getScheme().equals("http");
         String[] attempts = baseIsHttp
                 ? new String[]{"http|v3", "http|v2"}
                 : new String[]{"http|v3", "https|v3", "http|v2", "https|v2"};
+        StringBuilder reasons = new StringBuilder();
         for (String attempt : attempts) {
             String scheme = attempt.split("\\|")[0];
             String version = attempt.split("\\|")[1];
@@ -515,12 +515,19 @@ final class BlompSwiftStore implements AutoCloseable {
                 }
                 return keystoneV2(URI.create(endpoint));
             } catch (IOException failure) {
-                lastFailure = failure;
+                // surface every path so a "null" exception message can never
+                // hide what actually failed
+                String reason = failure.getMessage() == null
+                        ? failure.getClass().getSimpleName()
+                        : failure.getMessage();
+                if (reasons.length() > 0) {
+                    reasons.append("; ");
+                }
+                reasons.append(version).append("/").append(scheme).append(": ").append(reason);
             }
         }
-        throw new IOException("could not authenticate against Blomp with any method "
-                + "(http/https, v3/v2): " + (lastFailure == null ? "unknown" : lastFailure.getMessage()),
-                lastFailure);
+        throw new IOException("could not authenticate against Blomp with any method — "
+                + reasons);
     }
 
     /**
@@ -532,6 +539,13 @@ final class BlompSwiftStore implements AutoCloseable {
      * attempt re-resolves.
      */
     private URI connectableUri(URI uri) {
+        // https must keep the real hostname: Blomp's TLS certificate does not
+        // cover their bare IPs, and Java verifies the hostname. IP pinning is
+        // therefore only applied to plain http (Blomp's storage API is
+        // http-only anyway).
+        if ("https".equals(uri.getScheme())) {
+            return uri;
+        }
         String key = uri.getHost();
         String cachedAddress = pinnedAddressesByHost.get(key);
         if (cachedAddress != null) {
@@ -659,14 +673,19 @@ final class BlompSwiftStore implements AutoCloseable {
         try {
             return http.send(request, HttpResponse.BodyHandlers.ofByteArray());
         } catch (java.net.http.HttpConnectTimeoutException e) {
+            dropPin(request.uri());
             throw new IOException("the Blomp authentication endpoint (" + authUrl + ", " + version
                     + ") did not accept a connection in time — their API may be down; retry");
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
             throw new IOException("Blomp authentication was interrupted", e);
         } catch (IOException e) {
+            dropPin(request.uri());
+            String reason = e.getMessage() == null
+                    ? e.getClass().getSimpleName() + " (TLS/connection-level failure)"
+                    : e.getMessage();
             throw new IOException("could not reach the Blomp authentication endpoint (" + authUrl
-                    + ", " + version + "): " + e.getMessage(), e);
+                    + ", " + version + "): " + reason, e);
         }
     }
 

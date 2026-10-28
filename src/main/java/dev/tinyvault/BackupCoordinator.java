@@ -275,12 +275,21 @@ final class BackupCoordinator {
                 Bukkit.savePlayers();
             });
             try {
+                // Paper saves worlds asynchronously — give the pipeline a moment
+                // to drain so the ZIP never captures half-written region files
+                Thread.sleep(2500L);
                 phase = Phase.ARCHIVING;
                 archiver.createArchive(archive);
             } finally {
+                // safety upgrade: restore autosave right after the archive is
+                // written, NOT after the long upload — the finished ZIP cannot
+                // be affected by later world changes, so the unsafe window is
+                // only save+archive, never the upload
                 awaitOnMainThread(() -> {
                     for (World world : Bukkit.getWorlds()) {
-                        world.setAutoSave(true);
+                        if (!world.isAutoSave()) {
+                            world.setAutoSave(true);
+                        }
                     }
                 });
             }

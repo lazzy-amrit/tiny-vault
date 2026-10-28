@@ -379,6 +379,11 @@ final class VaultCommand implements CommandExecutor, TabCompleter {
         if (lower.contains("expected ") && lower.contains("bytes") || lower.contains("propagat")) {
             return "the storage service is still catching up with the fresh upload";
         }
+        if (lower.contains("no subject alternative") || lower.contains("certificate")) {
+            return "Blomp's TLS certificate does not cover their raw storage IPs — the plugin "
+                    + "switches protocols automatically; if this repeats with every attempt, "
+                    + "Blomp changed their endpoints";
+        }
         if (lower.contains("etag mismatch") || lower.contains("checksum")) {
             return "the uploaded archive did not arrive intact — the corrupted copy was removed "
                     + "and the next run will retry";
